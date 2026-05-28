@@ -15,7 +15,9 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "__YOUR_TOKEN_HERE__")
 DATA_FILE = Path("vc_emojis.json")
 DEFAULT_EMOJI = ""
 EMPTY_STATUS = ""
-enabled = True
+
+# channel IDs where the bot is paused — use /vctoggle while in a VC to add/remove
+disabled_channels: set[int] = set()
 
 CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:[A-Za-z0-9_]+:\d+>")
 
@@ -80,6 +82,8 @@ async def update_channel_status(channel, status):
 
 
 async def refresh_channel(channel):
+    if channel.id in disabled_channels:
+        return
     await update_channel_status(channel, pick_status_for(channel))
 
 
@@ -92,8 +96,6 @@ async def on_ready():
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    if not enabled:
-        return
     to_refresh = set()
     if before.channel and before.channel != after.channel:
         to_refresh.add(before.channel)
@@ -165,7 +167,7 @@ async def vcdelete(interaction: discord.Interaction, user: discord.Member):
     )
 
 
-@bot.tree.command(name="vclist", description="See everyone's VC emoji.")
+@bot.tree.command(name="vclist", description="See VC emoji assignments. Shows your current channel if you're in one, otherwise the whole server.")
 async def vclist(interaction: discord.Interaction):
     if not user_emojis:
         await interaction.response.send_message(
@@ -174,13 +176,41 @@ async def vclist(interaction: discord.Interaction):
         )
         return
 
-    lines = []
-    for uid, emoji in user_emojis.items():
-        member = interaction.guild.get_member(uid) if interaction.guild else None
-        name = member.mention if member else f"Unknown user (`{uid}`)"
-        lines.append(f"{emoji}  {name}")
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
 
-    await interaction.response.send_message("**VC emoji assignments:**\n" + "\n".join(lines), ephemeral=True)
+    # if the user is in a VC, only show people in that channel
+    member = interaction.guild.get_member(interaction.user.id)
+    vc = member.voice.channel if member and member.voice else None
+
+    if vc:
+        members_to_show = [m for m in vc.members if m.id in user_emojis]
+        header = f"**Emojis in #{vc.name}:**"
+    else:
+        members_to_show = None
+        header = "**VC emoji assignments:**"
+
+    if members_to_show is not None:
+        if not members_to_show:
+            await interaction.response.send_message(
+                f"Nobody in #{vc.name if vc else 'that channel'} has an emoji assigned yet.",
+                ephemeral=True,
+            )
+            return
+        lines = [f"{user_emojis[m.id]}  {m.mention}" for m in members_to_show]
+    else:
+        lines = []
+        for uid, emoji in user_emojis.items():
+            member = interaction.guild.get_member(uid) if interaction.guild else None
+            if not member:
+                continue  # skip users no longer in the server
+            lines.append(f"{emoji}  {member.mention}")
+        if not lines:
+            await interaction.response.send_message("No assignments for anyone currently in this server.", ephemeral=True)
+            return
+
+    await interaction.response.send_message(header + "\n" + "\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="vcstatus", description="Manually refresh a voice channel's status.")
@@ -199,15 +229,32 @@ async def vcstatus(interaction: discord.Interaction, channel: discord.VoiceChann
         )
 
 
-@bot.tree.command(name="vctoggle", description="Pause or resume the VC status bot.")
+@bot.tree.command(name="vctoggle", description="Pause or resume the bot for the VC you're currently in.")
 @discord.app_commands.default_permissions(manage_channels=True)
 async def vctoggle(interaction: discord.Interaction):
-    global enabled
-    enabled = not enabled
-    await interaction.response.send_message(
-        f"Bot {'resumed' if enabled else 'paused'} — statuses will {'now' if enabled else 'no longer'} update automatically.",
-        ephemeral=True,
-    )
+    if not interaction.guild:
+        await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice or not member.voice.channel:
+        await interaction.response.send_message("You need to be in a voice channel to use this.", ephemeral=True)
+        return
+
+    channel = member.voice.channel
+
+    if channel.id in disabled_channels:
+        disabled_channels.discard(channel.id)
+        await interaction.response.send_message(
+            f"Resumed **#{channel.name}** — statuses will update automatically again.",
+            ephemeral=True,
+        )
+    else:
+        disabled_channels.add(channel.id)
+        await interaction.response.send_message(
+            f"Paused **#{channel.name}** — statuses won't update until you toggle it back on.",
+            ephemeral=True,
+        )
 
 
 @bot.event
