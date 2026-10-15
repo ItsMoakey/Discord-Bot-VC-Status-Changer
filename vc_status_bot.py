@@ -21,6 +21,19 @@ disabled_channels: set[int] = set()
 
 CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:[A-Za-z0-9_]+:\d+>")
 
+# Instagram no longer embeds in Discord, so posted links are re-posted with the host swapped
+# for an embed proxy. Defaults to kkinstagram.com; set EMBED_DOMAIN to point at your own
+# self-hosted instance instead (e.g. "ig.itsmoakey.net").
+EMBED_DOMAIN = os.getenv("EMBED_DOMAIN", "kkinstagram.com")
+
+# Matches post / reel / tv / share links. The lookbehind skips links wrapped in <...>,
+# which is how users deliberately suppress an embed.
+INSTAGRAM_LINK_PATTERN = re.compile(
+    r"(?<!<)https?://(?:www\.)?instagram\.com/"
+    r"((?:[A-Za-z0-9_.]+/)?(?:p|reels?|tv|share(?:/p|/reel)?)/[A-Za-z0-9_-]+)/?",
+    re.IGNORECASE,
+)
+
 
 def load_assignments():
     if DATA_FILE.exists():
@@ -38,6 +51,7 @@ user_emojis = load_assignments()
 intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
+intents.message_content = True  # needed to see Instagram links; enable "Message Content Intent" in the Developer Portal
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -103,6 +117,37 @@ async def on_voice_state_update(member, before, after):
         to_refresh.add(after.channel)
     for ch in to_refresh:
         await refresh_channel(ch)
+
+
+def find_instagram_embeds(text):
+    """Return embeddable URLs for every Instagram post/reel link in `text`, de-duplicated in order."""
+    urls = []
+    for match in INSTAGRAM_LINK_PATTERN.finditer(text):
+        url = f"https://{EMBED_DOMAIN}/{match.group(1)}/"
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+
+    urls = find_instagram_embeds(message.content)
+    if urls:
+        try:
+            await message.reply("\n".join(urls), mention_author=False)
+        except discord.HTTPException as e:
+            print(f"  ✗  couldn't post Instagram embed in #{message.channel}: {e}")
+        else:
+            # hide Instagram's own (empty) preview so the embed isn't doubled; needs Manage Messages
+            try:
+                await message.edit(suppress=True)
+            except discord.HTTPException:
+                pass
+
+    await bot.process_commands(message)
 
 
 def has_manage_channels(interaction):
