@@ -22,9 +22,9 @@ disabled_channels: set[int] = set()
 CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:[A-Za-z0-9_]+:\d+>")
 
 # Instagram no longer embeds in Discord, so posted links are re-posted with the host swapped
-# for an embed proxy. Defaults to kkinstagram.com; set EMBED_DOMAIN to point at your own
+# for an embed proxy. Defaults to fxinstagram.com; set EMBED_DOMAIN to point at your own
 # self-hosted instance instead (e.g. "ig.itsmoakey.net").
-EMBED_DOMAIN = os.getenv("EMBED_DOMAIN", "kkinstagram.com")
+EMBED_DOMAIN = os.getenv("EMBED_DOMAIN", "fxinstagram.com")
 
 # Matches post / reel / tv / share links. The lookbehind skips links wrapped in <...>,
 # which is how users deliberately suppress an embed.
