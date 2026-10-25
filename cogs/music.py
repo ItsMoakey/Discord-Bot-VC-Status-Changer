@@ -22,7 +22,7 @@ YDL_OPTS = {
 }
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -af dynaudnorm=f=150:g=15",
+    "options": "-vn",
 }
 
 
@@ -60,6 +60,7 @@ def resolve_stream(webpage_url: str) -> str:
 
 
 MAX_PLAYLIST = 50
+IDLE_LEAVE_SECONDS = 10  # leave the voice channel this long after the music ends (0 = right away)
 UNAVAILABLE_TITLES = {"[Private video]", "[Deleted video]"}
 
 
@@ -95,6 +96,7 @@ class GuildState:
         self.loop = False
         self.volume = 0.5
         self.text_channel: discord.abc.Messageable | None = None
+        self.idle_task: asyncio.Task | None = None
 
 
 class Music(commands.Cog):
@@ -107,8 +109,21 @@ class Music(commands.Cog):
 
     # ---------- playback core ----------
 
+    async def leave_after_idle(self, guild: discord.Guild):
+        """Disconnect once the music has ended, unless something new starts in the meantime."""
+        await asyncio.sleep(IDLE_LEAVE_SECONDS)
+        vc = guild.voice_client
+        state = self.states.get(guild.id)
+        if vc is None or vc.is_playing() or vc.is_paused() or (state and state.queue):
+            return
+        self.states.pop(guild.id, None)
+        await vc.disconnect()
+
     async def play_next(self, guild: discord.Guild):
         state = self.state(guild)
+        if state.idle_task:  # something is (about to be) playing, so don't leave
+            state.idle_task.cancel()
+            state.idle_task = None
         vc = guild.voice_client
         if vc is None:
             state.current = None
@@ -121,6 +136,7 @@ class Music(commands.Cog):
             track = state.queue.popleft()
         else:
             state.current = None
+            state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
             return
 
         try:

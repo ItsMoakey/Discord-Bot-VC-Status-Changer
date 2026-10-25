@@ -36,7 +36,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 
 - Give the bot **Connect** and **Speak**.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
-- The bot leaves on its own when everyone else leaves the voice channel. Queues are in memory and reset on restart.
+- The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
 
 ### Setup
 
