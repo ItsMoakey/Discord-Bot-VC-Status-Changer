@@ -72,11 +72,11 @@ class VCStatus(commands.Cog):
     # ---------- status logic ----------
 
     def pick_status_for(self, channel: discord.VoiceChannel) -> str:
-        # ignore bots so the music bot sitting in a channel doesn't count as a person
-        humans = [m for m in channel.members if not m.bot]
-        if not humans:
+        # every member counts, including bots: give the bot an emoji with /vcadd and it shows up too
+        members = channel.members
+        if not members:
             return EMPTY_STATUS
-        emojis = [self.user_emojis[m.id] for m in humans if m.id in self.user_emojis]
+        emojis = [self.user_emojis[m.id] for m in members if m.id in self.user_emojis]
         if not emojis:
             return DEFAULT_EMOJI
         return " ".join(emojis)
