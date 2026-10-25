@@ -1,15 +1,65 @@
 ### A Discord bot that updates voice channel statuses to show custom emojis for who's currently in them.
 
-- To use, create a bot in the Discord Developer Portal, invite it to your server with the "Manage Channels" permission, and set its token as an environment variable named `DISCORD_TOKEN`.
-Users can set their own emoji with the `/vcadd` command, and optionally specify another user if they have the "Manage Channels" permission. Emojis can be either custom server emojis (e.g. `<:thonkang:219069250692841473>`) or any unicode emoji (e.g. `🐸`). When a user joins a voice channel, the bot will update the channel's status to show the assigned emojis of all users currently in that channel. If no one in the channel has an assigned emoji, it will show a default emoji (which is currently blank but can be customized). If everyone in the channel has their emoji removed, it will clear the status entirely
+- To use, create a bot in the Discord Developer Portal, invite it to your server with the "Manage Channels" permission, and set its token as an environment variable named `DISCORD_TOKEN` (or put it in a `.env` file, see `.env.example`).
+Users can set their own emoji with the `/vcadd` command, and optionally specify another user if they have the "Manage Channels" permission. Emojis can be either custom server emojis (e.g. `<:thonkang:219069250692841473>`) or any unicode emoji (e.g. `🐸`). When a user joins a voice channel, the bot will update the channel's status to show the assigned emojis of all users currently in that channel. If no one in the channel has an assigned emoji, it will show a default emoji (which is currently blank but can be customized). If everyone in the channel has their emoji removed, it will clear the status entirely. Bots (including the music bot) are ignored when working out a channel's status.
 
-- Add token in the code or set it as an environment variable before running the script. Note that the bot needs the "Manage Channels" permission to update voice channel statuses, and users need that permission to set emojis for others or to manually refresh statuses.
+- The bot needs the "Manage Channels" permission to update voice channel statuses, and users need that permission to set emojis for others or to manually refresh statuses.
+- Other commands: `/vcdelete`, `/vclist`, `/vcstatus <channel>` (manual refresh), `/vctoggle` (pause/resume updates for the VC you're in).
+- Assignments are stored in `vc_emojis.json` in the folder you run the bot from. Set `VC_EMOJI_FILE` to change that.
 
 ### Instagram embeds
 
-Instagram links no longer embed in Discord, so when someone posts an Instagram post, reel, or share link the bot replies with the same link on an embed proxy (default `kkinstagram.com`) and hides the original empty preview.
+Instagram links no longer embed in Discord, so when someone posts an Instagram post, reel, or share link the bot replies with the same link on an embed proxy (default `fxinstagram.com`) and hides the original empty preview.
 
 - Enable **Message Content Intent** for the bot in the Developer Portal (Bot → Privileged Gateway Intents), otherwise it can't see links.
 - Give the bot **Send Messages** and **Manage Messages** (the latter is only needed to hide the original preview; without it the bot still replies).
 - Set `EMBED_DOMAIN` to use a different or self-hosted proxy, e.g. `EMBED_DOMAIN=ig.example.com`.
 - Wrap a link in `<...>` to stop the bot from embedding it.
+
+### Music
+
+Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a per-server queue.
+
+| Command | What it does |
+|---|---|
+| `/play <url or search>` | Play or queue a song |
+| `/pause` / `/resume` | Pause or resume |
+| `/skip` | Skip the current song |
+| `/stop` | Stop and clear the queue |
+| `/leave` | Disconnect |
+| `/queue` | Show the queue |
+| `/nowplaying` | Show the current song |
+| `/volume <0-100>` | Set volume |
+| `/loop` | Toggle looping the current song |
+| `/shuffle` | Shuffle the queue |
+
+- Give the bot **Connect** and **Speak**.
+- Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
+- The bot leaves on its own when everyone else leaves the voice channel. Queues are in memory and reset on restart.
+
+### Setup
+
+1. In the Developer Portal, enable the **Server Members Intent** and **Message Content Intent**.
+2. Invite the bot with the `bot` and `applications.commands` scopes and the permissions above (View Channels, Send Messages, Manage Messages, Manage Channels, Connect, Speak).
+3. Install and run:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env             # then put your token in .env
+python vc_status_bot.py
+```
+
+Set `DEV_GUILD_ID` in `.env` while testing so slash commands appear instantly instead of after global sync.
+
+### Layout
+
+```
+vc_status_bot.py        entry point, loads the cogs
+cogs/vc_status.py       VC emoji statuses
+cogs/instagram_embed.py Instagram link embeds
+cogs/music.py           music player
+```
+
+Remove a cog from `EXTENSIONS` in `vc_status_bot.py` to turn that feature off. Stop the old standalone `vc_status_bot.py` process before starting this one, otherwise both will answer every Instagram link.
