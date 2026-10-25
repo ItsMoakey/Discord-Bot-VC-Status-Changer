@@ -3,6 +3,7 @@ import logging
 import random
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import discord
 import yt_dlp
@@ -56,6 +57,35 @@ def extract_info(query: str) -> dict:
 def resolve_stream(webpage_url: str) -> str:
     """Blocking: get a fresh direct stream URL (they expire, so do it at play time)."""
     return extract_info(webpage_url)["url"]
+
+
+MAX_PLAYLIST = 50
+UNAVAILABLE_TITLES = {"[Private video]", "[Deleted video]"}
+
+
+def is_playlist_url(query: str) -> bool:
+    """True for pure playlist links (YouTube /playlist?list=..., SoundCloud /sets/...).
+    A normal video link with &list=... on it is NOT a playlist link and plays just that video."""
+    if not query.startswith(("http://", "https://")):
+        return False
+    u = urlparse(query)
+    host = u.netloc.lower()
+    if "youtube.com" in host:
+        return u.path.startswith("/playlist")
+    if "soundcloud.com" in host:
+        return "/sets/" in u.path
+    return False
+
+
+def extract_playlist(url: str) -> tuple[str, list[dict]]:
+    """Blocking: list a playlist's entries (titles/links only, no stream URLs) up to MAX_PLAYLIST."""
+    opts = {**YDL_OPTS, "noplaylist": False, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = [e for e in (info.get("entries") or []) if e]
+    if not entries:
+        raise ValueError("No songs found in that playlist.")
+    return info.get("title") or "Playlist", entries
 
 
 class GuildState:
@@ -138,6 +168,8 @@ class Music(commands.Cog):
         vc = await self.ensure_voice(interaction)
         if vc is None:
             return
+        if is_playlist_url(query):
+            return await self.enqueue_playlist(interaction, vc, query)
         try:
             info = await asyncio.to_thread(extract_info, query)
         except Exception as e:
@@ -163,10 +195,44 @@ class Music(commands.Cog):
             await self.play_next(interaction.guild)
 
     @app_commands.command(name="play", description="Play a song from a URL or search term")
-    @app_commands.describe(query="YouTube/SoundCloud URL or search words")
+    @app_commands.describe(query="Song link, playlist link, or search words")
     @app_commands.guild_only()
     async def play(self, interaction: discord.Interaction, query: str):
         await self.enqueue(interaction, query)
+
+    async def enqueue_playlist(self, interaction: discord.Interaction, vc: discord.VoiceClient, url: str):
+        try:
+            title, entries = await asyncio.to_thread(extract_playlist, url)
+        except Exception as e:
+            log.warning("Playlist lookup failed for %r: %s", url, e)
+            return await interaction.followup.send("Couldn't read that playlist. Is it a public playlist link?")
+
+        tracks = []
+        for e in entries:
+            link = e.get("webpage_url") or e.get("url")
+            if not link or e.get("title") in UNAVAILABLE_TITLES:
+                continue  # skip private/deleted/unplayable entries
+            tracks.append(
+                Track(
+                    title=e.get("title") or "Unknown",
+                    webpage_url=link,
+                    duration=e.get("duration"),
+                    requester=interaction.user.display_name,
+                )
+            )
+        if not tracks:
+            return await interaction.followup.send("Couldn't find any playable songs in that playlist.")
+
+        state = self.state(interaction.guild)
+        state.text_channel = interaction.channel
+        state.queue.extend(tracks)
+
+        msg = f"Queued **{len(tracks)}** songs from **{title}**."
+        if len(entries) >= MAX_PLAYLIST:
+            msg += f" (Limited to the first {MAX_PLAYLIST}.)"
+        await interaction.followup.send(msg)
+        if not (vc.is_playing() or vc.is_paused()):
+            await self.play_next(interaction.guild)
 
     @app_commands.command(name="move", description="Move a song already in the queue (default: to position 1, next up)")
     @app_commands.describe(position="Current position of the song in /queue", to="New position (default 1 = plays next)")

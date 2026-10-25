@@ -22,7 +22,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 
 | Command | What it does |
 |---|---|
-| `/play <url or search>` | Play or queue a song |
+| `/play <url or search>` | Play or queue a song. A playlist link (YouTube `/playlist?list=...`, SoundCloud sets) queues the first 50 songs; a video link with `&list=` on it plays just that video |
 | `/move <position> [to]` | Move a song already in the queue to position 1 (next up), or to `to` |
 | `/pause` / `/resume` | Pause or resume |
 | `/skip` | Skip the current song |
