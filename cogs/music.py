@@ -133,10 +133,7 @@ class Music(commands.Cog):
 
     # ---------- commands ----------
 
-    @app_commands.command(name="play", description="Play a song from a URL or search term")
-    @app_commands.describe(query="YouTube/SoundCloud URL or search words")
-    @app_commands.guild_only()
-    async def play(self, interaction: discord.Interaction, query: str):
+    async def enqueue(self, interaction: discord.Interaction, query: str):
         await interaction.response.defer()
         vc = await self.ensure_voice(interaction)
         if vc is None:
@@ -164,6 +161,36 @@ class Music(commands.Cog):
         else:
             await interaction.followup.send(f"Loading **{track.title}**...")
             await self.play_next(interaction.guild)
+
+    @app_commands.command(name="play", description="Play a song from a URL or search term")
+    @app_commands.describe(query="YouTube/SoundCloud URL or search words")
+    @app_commands.guild_only()
+    async def play(self, interaction: discord.Interaction, query: str):
+        await self.enqueue(interaction, query)
+
+    @app_commands.command(name="move", description="Move a song already in the queue (default: to position 1, next up)")
+    @app_commands.describe(position="Current position of the song in /queue", to="New position (default 1 = plays next)")
+    @app_commands.guild_only()
+    async def move(
+        self,
+        interaction: discord.Interaction,
+        position: app_commands.Range[int, 1],
+        to: app_commands.Range[int, 1] = 1,
+    ):
+        state = self.state(interaction.guild)
+        items = list(state.queue)
+        if not items:
+            return await interaction.response.send_message("The queue is empty.", ephemeral=True)
+        if position > len(items):
+            return await interaction.response.send_message(
+                f"There's no song at position {position} (queue has {len(items)}).", ephemeral=True
+            )
+        to = min(to, len(items))
+        track = items.pop(position - 1)
+        items.insert(to - 1, track)
+        state.queue = deque(items)
+        where = "next up" if to == 1 else f"position {to}"
+        await interaction.response.send_message(f"Moved **{track.title}** to {where}.")
 
     @app_commands.command(name="skip", description="Skip the current song")
     @app_commands.guild_only()

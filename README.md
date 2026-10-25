@@ -23,6 +23,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 | Command | What it does |
 |---|---|
 | `/play <url or search>` | Play or queue a song |
+| `/move <position> [to]` | Move a song already in the queue to position 1 (next up), or to `to` |
 | `/pause` / `/resume` | Pause or resume |
 | `/skip` | Skip the current song |
 | `/stop` | Stop and clear the queue |
@@ -61,5 +62,3 @@ cogs/vc_status.py       VC emoji statuses
 cogs/instagram_embed.py Instagram link embeds
 cogs/music.py           music player
 ```
-
-Remove a cog from `EXTENSIONS` in `vc_status_bot.py` to turn that feature off. Stop the old standalone `vc_status_bot.py` process before starting this one, otherwise both will answer every Instagram link.

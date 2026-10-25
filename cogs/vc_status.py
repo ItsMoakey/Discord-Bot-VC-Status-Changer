@@ -177,7 +177,7 @@ class VCStatus(commands.Cog):
     async def vclist(self, interaction: discord.Interaction):
         if not self.user_emojis:
             return await interaction.response.send_message(
-                "Nobody has an emoji yet — use `/vcadd` to set one!", ephemeral=True
+                "Nobody has an emoji yet - use `/vcadd` to set one!", ephemeral=True
             )
 
         member = interaction.guild.get_member(interaction.user.id)
@@ -234,10 +234,10 @@ class VCStatus(commands.Cog):
         channel = member.voice.channel
         if channel.id in self.disabled_channels:
             self.disabled_channels.discard(channel.id)
-            msg = f"Resumed **#{channel.name}** — statuses will update automatically again."
+            msg = f"Resumed **#{channel.name}** - statuses will update automatically again."
         else:
             self.disabled_channels.add(channel.id)
-            msg = f"Paused **#{channel.name}** — statuses won't update until you toggle it back on."
+            msg = f"Paused **#{channel.name}** - statuses won't update until you toggle it back on."
         await interaction.response.send_message(msg, ephemeral=True)
 
 
