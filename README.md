@@ -35,6 +35,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 | `/shuffle` | Shuffle the queue |
 
 - Give the bot **Connect** and **Speak**.
+- To keep the channel tidy, "Loading..." and "Now playing" are one message that gets edited, and the next "Now playing" edits it again as long as it's still the newest message in the channel. Plain confirmations and errors (`/skip`, `/pause`, `/resume`, `/volume`, `/queue`, `/nowplaying`, "Nothing is playing", etc.) are only visible to the person who ran the command. Queue changes (`/play` adding a song, `/move`, `/shuffle`, `/loop`) and `/stop`/`/leave` stay public.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
 - The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
 

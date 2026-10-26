@@ -97,6 +97,7 @@ class GuildState:
         self.volume = 0.5
         self.text_channel: discord.abc.Messageable | None = None
         self.idle_task: asyncio.Task | None = None
+        self.np_id: int | None = None  # id of our latest "Now playing" message, so we can edit it
 
 
 class Music(commands.Cog):
@@ -119,7 +120,35 @@ class Music(commands.Cog):
         self.states.pop(guild.id, None)
         await vc.disconnect()
 
-    async def play_next(self, guild: discord.Guild):
+    async def announce(self, state: GuildState, text: str, first: discord.WebhookMessage | None = None):
+        """Show the 'Now playing' text while keeping the channel tidy.
+
+        - `first`: the reply the command already posted ("Loading...", "Queued N songs..."), so the
+          loading and now-playing text end up in one message.
+        - otherwise, if our last "Now playing" message is still the newest message in the channel,
+          edit it instead of posting another one.
+        - otherwise post a new message.
+        """
+        channel = state.text_channel
+        if channel is None:
+            return
+        try:
+            if first is not None:
+                await first.edit(content=text)
+                state.np_id = first.id
+                return
+            if state.np_id and getattr(channel, "last_message_id", None) == state.np_id:
+                await channel.get_partial_message(state.np_id).edit(content=text)
+                return
+        except discord.HTTPException as e:
+            log.info("Couldn't edit the now-playing message, sending a new one: %s", e)
+        try:
+            msg = await channel.send(text)
+            state.np_id = msg.id
+        except discord.HTTPException as e:
+            log.warning("Couldn't send the now-playing message: %s", e)
+
+    async def play_next(self, guild: discord.Guild, first: discord.WebhookMessage | None = None, header: str = ""):
         state = self.state(guild)
         if state.idle_task:  # something is (about to be) playing, so don't leave
             state.idle_task.cancel()
@@ -136,6 +165,8 @@ class Music(commands.Cog):
             track = state.queue.popleft()
         else:
             state.current = None
+            if header:  # every remaining song failed: replace "Loading..." with what happened
+                await self.announce(state, header.rstrip(), first)
             state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
             return
 
@@ -144,9 +175,8 @@ class Music(commands.Cog):
         except Exception as e:
             log.warning("Failed to resolve %s: %s", track.webpage_url, e)
             state.current = None
-            if state.text_channel:
-                await state.text_channel.send(f"Couldn't play **{track.title}**, skipping.")
-            return await self.play_next(guild)
+            # carried into the next "Now playing" text instead of posting a separate message
+            return await self.play_next(guild, first, header + f"Couldn't play **{track.title}**, skipping.\n")
 
         state.current = track
         source = discord.PCMVolumeTransformer(
@@ -159,38 +189,48 @@ class Music(commands.Cog):
             asyncio.run_coroutine_threadsafe(self.play_next(guild), self.bot.loop)
 
         vc.play(source, after=after)
-        if state.text_channel and not state.loop:
-            await state.text_channel.send(
-                f"Now playing: **{track.title}** [{fmt_duration(track.duration)}] "
-                f"(requested by {track.requester})"
+        if first is not None or not state.loop:
+            await self.announce(
+                state,
+                f"{header}Now playing: **{track.title}** [{fmt_duration(track.duration)}] "
+                f"(requested by {track.requester})",
+                first,
             )
 
-    async def ensure_voice(self, interaction: discord.Interaction) -> discord.VoiceClient | None:
-        user_vc = getattr(interaction.user, "voice", None)
-        if not user_vc or not user_vc.channel:
-            await interaction.followup.send("Join a voice channel first.", ephemeral=True)
-            return None
-        vc = interaction.guild.voice_client
+    async def join_voice(self, guild: discord.Guild, channel: discord.abc.Connectable) -> discord.VoiceClient:
+        vc = guild.voice_client
         if vc is None:
-            vc = await user_vc.channel.connect()
-        elif vc.channel != user_vc.channel:
-            await vc.move_to(user_vc.channel)
+            vc = await channel.connect()
+        elif vc.channel != channel:
+            await vc.move_to(channel)
         return vc
+
+    async def fail(self, interaction: discord.Interaction, text: str):
+        """Tell only the person who ran the command that something went wrong.
+
+        After a public defer() Discord ignores ephemeral on the first reply, so the "thinking..."
+        message is deleted first and the error goes out as a fresh ephemeral follow-up."""
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+        await interaction.followup.send(text, ephemeral=True)
 
     # ---------- commands ----------
 
     async def enqueue(self, interaction: discord.Interaction, query: str):
+        voice = getattr(interaction.user, "voice", None)
+        if not voice or not voice.channel:
+            return await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
         await interaction.response.defer()
-        vc = await self.ensure_voice(interaction)
-        if vc is None:
-            return
+        vc = await self.join_voice(interaction.guild, voice.channel)
         if is_playlist_url(query):
             return await self.enqueue_playlist(interaction, vc, query)
         try:
             info = await asyncio.to_thread(extract_info, query)
         except Exception as e:
             log.warning("Lookup failed for %r: %s", query, e)
-            return await interaction.followup.send("Couldn't find anything for that.")
+            return await self.fail(interaction, "Couldn't find anything for that.")
 
         track = Track(
             title=info.get("title", "Unknown"),
@@ -207,8 +247,9 @@ class Music(commands.Cog):
                 f"Queued: **{track.title}** (position {len(state.queue)})"
             )
         else:
-            await interaction.followup.send(f"Loading **{track.title}**...")
-            await self.play_next(interaction.guild)
+            # this "Loading..." message is edited into the "Now playing" message, not followed by a second one
+            first = await interaction.followup.send(f"Loading **{track.title}**...")
+            await self.play_next(interaction.guild, first)
 
     @app_commands.command(name="play", description="Play a song from a URL or search term")
     @app_commands.describe(query="Song link, playlist link, or search words")
@@ -221,7 +262,7 @@ class Music(commands.Cog):
             title, entries = await asyncio.to_thread(extract_playlist, url)
         except Exception as e:
             log.warning("Playlist lookup failed for %r: %s", url, e)
-            return await interaction.followup.send("Couldn't read that playlist. Is it a public playlist link?")
+            return await self.fail(interaction, "Couldn't read that playlist. Is it a public playlist link?")
 
         tracks = []
         for e in entries:
@@ -237,18 +278,22 @@ class Music(commands.Cog):
                 )
             )
         if not tracks:
-            return await interaction.followup.send("Couldn't find any playable songs in that playlist.")
+            return await self.fail(interaction, "Couldn't find any playable songs in that playlist.")
 
         state = self.state(interaction.guild)
         state.text_channel = interaction.channel
         state.queue.extend(tracks)
 
-        msg = f"Queued **{len(tracks)}** songs from **{title}**."
+        header = f"Queued **{len(tracks)}** songs from **{title}**."
         if len(entries) >= MAX_PLAYLIST:
-            msg += f" (Limited to the first {MAX_PLAYLIST}.)"
-        await interaction.followup.send(msg)
-        if not (vc.is_playing() or vc.is_paused()):
-            await self.play_next(interaction.guild)
+            header += f" (Limited to the first {MAX_PLAYLIST}.)"
+        header += "\n"
+        if vc.is_playing() or vc.is_paused():
+            await interaction.followup.send(header.rstrip())
+        else:
+            # one message: the "Queued..." line plus the first song's "Now playing" line
+            first = await interaction.followup.send(header + "Loading the first song...")
+            await self.play_next(interaction.guild, first, header)
 
     @app_commands.command(name="move", description="Move a song already in the queue (default: to position 1, next up)")
     @app_commands.describe(position="Current position of the song in /queue", to="New position (default 1 = plays next)")
@@ -282,7 +327,7 @@ class Music(commands.Cog):
             state = self.state(interaction.guild)
             state.loop = False  # otherwise loop would replay the skipped track
             vc.stop()
-            await interaction.response.send_message("Skipped.")
+            await interaction.response.send_message("Skipped.", ephemeral=True)
         else:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
@@ -292,7 +337,7 @@ class Music(commands.Cog):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message("Paused.")
+            await interaction.response.send_message("Paused.", ephemeral=True)
         else:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
@@ -302,7 +347,7 @@ class Music(commands.Cog):
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message("Resumed.")
+            await interaction.response.send_message("Resumed.", ephemeral=True)
         else:
             await interaction.response.send_message("Nothing is paused.", ephemeral=True)
 
@@ -340,7 +385,7 @@ class Music(commands.Cog):
             lines.append(f"{i}. {t.title} [{fmt_duration(t.duration)}]")
         if len(state.queue) > 10:
             lines.append(f"...and {len(state.queue) - 10} more")
-        await interaction.response.send_message("\n".join(lines))
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     @app_commands.command(name="nowplaying", description="Show the current song")
     @app_commands.guild_only()
@@ -349,7 +394,7 @@ class Music(commands.Cog):
         if not t:
             return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
         await interaction.response.send_message(
-            f"**{t.title}** [{fmt_duration(t.duration)}]\n{t.webpage_url}"
+            f"**{t.title}** [{fmt_duration(t.duration)}]\n{t.webpage_url}", ephemeral=True
         )
 
     @app_commands.command(name="volume", description="Set volume (0-100)")
@@ -361,7 +406,7 @@ class Music(commands.Cog):
         vc = interaction.guild.voice_client
         if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
             vc.source.volume = state.volume
-        await interaction.response.send_message(f"Volume set to {level}%.")
+        await interaction.response.send_message(f"Volume set to {level}%.", ephemeral=True)
 
     @app_commands.command(name="loop", description="Toggle looping the current song")
     @app_commands.guild_only()
