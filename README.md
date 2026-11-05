@@ -33,11 +33,22 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 | `/volume <0-100>` | Set volume |
 | `/loop` | Toggle looping the current song |
 | `/shuffle` | Shuffle the queue |
+| `/joinsound [enabled]` | Toggle the arrival clip for this server, or explicitly set on/off (Manage Channels required) |
 
 - Give the bot **Connect** and **Speak**.
 - To keep the channel tidy, "Loading..." and "Now playing" are one message that gets edited, and the next "Now playing" edits it again as long as it's still the newest message in the channel. Plain confirmations and errors (`/skip`, `/pause`, `/resume`, `/volume`, `/queue`, `/nowplaying`, "Nothing is playing", etc.) are only visible to the person who ran the command. Queue changes (`/play` adding a song, `/move`, `/shuffle`, `/loop`) and `/stop`/`/leave` stay public.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
 - The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
+
+#### Join sound
+
+When `/play` first connects the bot to voice, it plays your local audio clip before starting music. Adding songs or moving an existing connection does not replay the clip or interrupt the current song.
+
+1. Put a short audio file named `join.mp3` in the folder you run the bot from. MP3, WAV, Ogg, and other FFmpeg-supported formats work; for a different name or location, set `JOIN_SOUND_FILE` in `.env` and restart the bot.
+2. Join sounds are enabled by default. Use `/joinsound` to toggle them for the current server, or `/joinsound enabled:False` / `/joinsound enabled:True` to explicitly turn them off/on. Requires **Manage Channels**. Changes apply to future joins, not a clip already playing.
+3. The toggle is saved per server in `join_sound_settings.json` and survives bot restarts and voice disconnects. Set `JOIN_SOUND_SETTINGS_FILE` to change the storage path. Relative audio/settings paths are resolved from the folder you run the bot from.
+
+The clip uses the music player's current volume and requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission or Discord sound ID. A missing clip or playback-start failure is logged and music continues without the announcement. Keep the clip short: the first song waits for it to finish.
 
 ### Setup
 

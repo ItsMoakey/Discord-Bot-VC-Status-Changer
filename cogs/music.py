@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
+import os
 import random
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 import discord
@@ -104,6 +107,15 @@ class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.states: dict[int, GuildState] = {}
+        self.join_sound_file = Path(os.getenv("JOIN_SOUND_FILE") or "join.mp3")
+        self.join_sound_settings_file = Path(
+            os.getenv("JOIN_SOUND_SETTINGS_FILE") or "join_sound_settings.json"
+        )
+        self.join_sound_enabled: dict[str, bool] = (
+            json.loads(self.join_sound_settings_file.read_text(encoding="utf-8"))
+            if self.join_sound_settings_file.exists() else {}
+        )
+        self.voice_locks: dict[int, asyncio.Lock] = {}
 
     def state(self, guild: discord.Guild) -> GuildState:
         return self.states.setdefault(guild.id, GuildState())
@@ -197,13 +209,59 @@ class Music(commands.Cog):
                 first,
             )
 
+    async def play_join_sound(self, vc: discord.VoiceClient):
+        """Finish the local arrival clip before /play starts using the audio player."""
+        if not self.join_sound_enabled.get(str(vc.guild.id), True):
+            return
+        if not self.join_sound_file.is_file():
+            log.warning("Join sound file not found: %s; continuing without it", self.join_sound_file)
+            return
+
+        loop = asyncio.get_running_loop()
+        finished = loop.create_future()
+
+        def complete(error):
+            if not finished.done():
+                finished.set_result(error)
+
+        def after(error):
+            loop.call_soon_threadsafe(complete, error)
+
+        source = None
+        try:
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(str(self.join_sound_file), options="-vn"),
+                volume=self.state(vc.guild).volume,
+            )
+            vc.play(source, after=after)
+        except (OSError, discord.ClientException) as e:
+            if source is not None:
+                source.cleanup()
+            log.warning("Couldn't start join sound %s: %s", self.join_sound_file, e)
+            return
+        try:
+            error = await finished
+            if error:
+                log.warning("Join sound playback failed: %s", error)
+        except asyncio.CancelledError:
+            if vc.source is source:
+                vc.stop()
+            raise
+
     async def join_voice(self, guild: discord.Guild, channel: discord.abc.Connectable) -> discord.VoiceClient:
-        vc = guild.voice_client
-        if vc is None:
-            vc = await channel.connect()
-        elif vc.channel != channel:
-            await vc.move_to(channel)
-        return vc
+        # Other /play requests must wait for both the connection and its arrival clip.
+        async with self.voice_locks.setdefault(guild.id, asyncio.Lock()):
+            vc = guild.voice_client
+            if vc is None:
+                vc = await channel.connect()
+                state = self.state(guild)
+                if state.idle_task:
+                    state.idle_task.cancel()
+                    state.idle_task = None
+                await self.play_join_sound(vc)
+            elif vc.channel != channel:
+                await vc.move_to(channel)
+            return vc
 
     async def fail(self, interaction: discord.Interaction, text: str):
         """Tell only the person who ran the command that something went wrong.
@@ -217,6 +275,34 @@ class Music(commands.Cog):
         await interaction.followup.send(text, ephemeral=True)
 
     # ---------- commands ----------
+
+    @app_commands.command(name="joinsound", description="Toggle the arrival sound for this server")
+    @app_commands.describe(enabled="Turn it on or off; omit to toggle")
+    @app_commands.default_permissions(manage_channels=True)
+    @app_commands.guild_only()
+    async def joinsound(self, interaction: discord.Interaction, enabled: bool | None = None):
+        if not interaction.permissions.manage_channels:
+            return await interaction.response.send_message(
+                "You need Manage Channels to change the join sound.", ephemeral=True
+            )
+        guild_id = str(interaction.guild.id)
+        if enabled is None:
+            enabled = not self.join_sound_enabled.get(guild_id, True)
+        settings = {**self.join_sound_enabled, guild_id: enabled}
+        try:
+            self.join_sound_settings_file.write_text(
+                json.dumps(settings, indent=2), encoding="utf-8"
+            )
+        except OSError:
+            log.exception("Couldn't save join sound settings")
+            return await interaction.response.send_message(
+                "Couldn't save the setting; nothing changed. Check the console.", ephemeral=True
+            )
+        self.join_sound_enabled = settings
+        text = f"Join sound is now **{'on' if enabled else 'off'}** for this server."
+        if enabled and not self.join_sound_file.is_file():
+            text += f" Add your audio file at `{self.join_sound_file}` before the next join."
+        await interaction.response.send_message(text, ephemeral=True)
 
     async def enqueue(self, interaction: discord.Interaction, query: str):
         voice = getattr(interaction.user, "voice", None)
