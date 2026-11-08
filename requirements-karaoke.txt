@@ -1,0 +1,6 @@
+# Install alongside requirements.txt in a Python 3.11 virtual environment.
+# PyTorch 2.5.1 does not provide Python 3.14 wheels. Keep these versions paired;
+# newer torchaudio releases change the audio-loading backend Demucs expects.
+torch==2.5.1
+torchaudio==2.5.1
+demucs==4.0.1

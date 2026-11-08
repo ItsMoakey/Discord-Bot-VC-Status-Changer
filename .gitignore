@@ -1,0 +1,11 @@
+# Python bytecode and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv-karaoke/
+
+# Local credentials and server preferences
+.env
+feature_settings.json
+join_sound_settings.json
+vc_emojis.json

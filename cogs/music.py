@@ -1,5 +1,5 @@
 import asyncio
-import json
+from typing import TYPE_CHECKING
 import logging
 import os
 import random
@@ -12,6 +12,9 @@ import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+
+if TYPE_CHECKING:
+    from cogs.karaoke import KaraokeSession
 
 log = logging.getLogger("musicbot")
 
@@ -35,6 +38,7 @@ class Track:
     webpage_url: str
     duration: int | None
     requester: str
+    karaoke: "KaraokeSession | None" = None
 
 
 def fmt_duration(seconds: int | None) -> str:
@@ -108,14 +112,8 @@ class Music(commands.Cog):
         self.bot = bot
         self.states: dict[int, GuildState] = {}
         self.join_sound_file = Path(os.getenv("JOIN_SOUND_FILE") or "join.mp3")
-        self.join_sound_settings_file = Path(
-            os.getenv("JOIN_SOUND_SETTINGS_FILE") or "join_sound_settings.json"
-        )
-        self.join_sound_enabled: dict[str, bool] = (
-            json.loads(self.join_sound_settings_file.read_text(encoding="utf-8"))
-            if self.join_sound_settings_file.exists() else {}
-        )
         self.voice_locks: dict[int, asyncio.Lock] = {}
+        self.play_locks: dict[int, asyncio.Lock] = {}
 
     def state(self, guild: discord.Guild) -> GuildState:
         return self.states.setdefault(guild.id, GuildState())
@@ -160,58 +158,165 @@ class Music(commands.Cog):
         except discord.HTTPException as e:
             log.warning("Couldn't send the now-playing message: %s", e)
 
-    async def play_next(self, guild: discord.Guild, first: discord.WebhookMessage | None = None, header: str = ""):
-        state = self.state(guild)
-        if state.idle_task:  # something is (about to be) playing, so don't leave
+    async def play_next(
+        self, guild: discord.Guild, first: discord.WebhookMessage | None = None,
+        header: str = "", completed: Track | None = None,
+    ):
+        async with self.play_locks.setdefault(guild.id, asyncio.Lock()):
+            state = self.states.get(guild.id)
+            if state is None or (completed is not None and state.current is not completed):
+                return
+            vc = guild.voice_client
+            if completed is None and vc and (vc.is_playing() or vc.is_paused()):
+                return
+            if state.idle_task:
+                state.idle_task.cancel()
+                state.idle_task = None
+            while True:
+                previous = state.current
+                track = previous if state.loop and previous else (
+                    state.queue.popleft() if state.queue else None
+                )
+                state.current = track
+                if previous is not track and previous and previous.karaoke:
+                    await previous.karaoke.finish()
+                    if self.states.get(guild.id) is not state or state.current is not track:
+                        return
+                vc = guild.voice_client
+                if vc is None:
+                    await self.clear_tracks(state, "Disconnected")
+                    return
+                if track is None:
+                    if header:
+                        await self.announce(state, header.rstrip(), first)
+                    state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
+                    return
+                feature = "karaoke" if track.karaoke else "music"
+                if not self.bot.features.enabled(guild.id, feature):
+                    state.loop = False
+                    continue
+                source = None
+                try:
+                    stream_url = (
+                        track.karaoke.audio_path if track.karaoke else
+                        await asyncio.to_thread(resolve_stream, track.webpage_url)
+                    )
+                    # A stop, leave, or toggle may have happened during extraction.
+                    if self.states.get(guild.id) is not state or state.current is not track:
+                        return
+                    options = {"options": "-vn"} if track.karaoke else FFMPEG_OPTS
+                    audio = discord.FFmpegPCMAudio(stream_url, **options)
+                    if track.karaoke:
+                        audio = track.karaoke.wrap_source(audio)
+                    source = discord.PCMVolumeTransformer(audio, volume=state.volume)
+
+                    def after(err, played=track):
+                        if err:
+                            log.error("Player error: %s", err)
+                        asyncio.run_coroutine_threadsafe(
+                            self.play_next(guild, completed=played), self.bot.loop
+                        )
+
+                    vc.play(source, after=after)
+                except Exception as error:
+                    if source is not None:
+                        source.cleanup()
+                    log.warning("Failed to play %s: %s", track.webpage_url, error)
+                    state.loop = False
+                    header += f"Couldn't play **{track.title}**, skipping.\n"
+                    continue
+                if track.karaoke:
+                    await track.karaoke.start()
+                if first is not None or not state.loop:
+                    await self.announce(
+                        state,
+                        f"{header}Now playing: **{track.title}** [{fmt_duration(track.duration)}] "
+                        f"(requested by {track.requester})",
+                        first,
+                    )
+                return
+
+    async def clear_tracks(self, state: GuildState, reason: str):
+        tracks = list(state.queue)
+        if state.current:
+            tracks.append(state.current)
+        state.queue.clear()
+        state.current = None
+        state.loop = False
+        if state.idle_task:
             state.idle_task.cancel()
             state.idle_task = None
+        for track in tracks:
+            if track.karaoke:
+                await track.karaoke.finish(reason)
+
+    async def disconnect(self, guild: discord.Guild, reason: str = "Disconnected"):
+        state = self.states.pop(guild.id, None)
         vc = guild.voice_client
-        if vc is None:
-            state.current = None
-            state.queue.clear()
+        if vc:
+            vc.stop()
+            if vc.source:
+                vc.source.cleanup()
+            await vc.disconnect()
+        if state:
+            await self.clear_tracks(state, reason)
+
+    async def on_feature_toggle(self, guild: discord.Guild, feature: str, enabled: bool):
+        if enabled or feature not in {"music", "karaoke"}:
+            return
+        state = self.states.get(guild.id)
+        if state is None:
             return
 
-        if state.loop and state.current:
-            track = state.current
-        elif state.queue:
-            track = state.queue.popleft()
+        def matches(track):
+            return bool(track.karaoke) == (feature == "karaoke")
+
+        removed = [track for track in state.queue if matches(track)]
+        state.queue = deque(track for track in state.queue if not matches(track))
+        for track in removed:
+            if track.karaoke:
+                await track.karaoke.finish("Karaoke disabled")
+        current = state.current
+        if current and matches(current):
+            state.loop = False
+            vc = guild.voice_client
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            await self.play_next(guild, completed=current)
+
+    async def enqueue_prepared(self, interaction: discord.Interaction, track: Track) -> bool:
+        if not self.bot.features.enabled(interaction.guild.id, "karaoke"):
+            await self.fail(interaction, "Karaoke was disabled while preparing this song.")
+            return False
+        voice = getattr(interaction.user, "voice", None)
+        if not voice or not voice.channel:
+            await self.fail(interaction, "Join a voice channel before starting karaoke.")
+            return False
+        vc = await self.join_voice(interaction.guild, voice.channel)
+        if not self.bot.features.enabled(interaction.guild.id, "karaoke"):
+            await self.fail(interaction, "Karaoke is disabled for this server.")
+            return False
+        state = self.state(interaction.guild)
+        state.text_channel = interaction.channel
+        state.queue.append(track)
+        send = interaction.channel.send if interaction.is_expired() else interaction.followup.send
+        if vc.is_playing() or vc.is_paused():
+            try:
+                await send(f"Queued karaoke: **{track.title}** (position {len(state.queue)})")
+            except discord.HTTPException:
+                log.warning("Could not announce queued karaoke", exc_info=True)
         else:
-            state.current = None
-            if header:  # every remaining song failed: replace "Loading..." with what happened
-                await self.announce(state, header.rstrip(), first)
-            state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
-            return
-
-        try:
-            stream_url = await asyncio.to_thread(resolve_stream, track.webpage_url)
-        except Exception as e:
-            log.warning("Failed to resolve %s: %s", track.webpage_url, e)
-            state.current = None
-            # carried into the next "Now playing" text instead of posting a separate message
-            return await self.play_next(guild, first, header + f"Couldn't play **{track.title}**, skipping.\n")
-
-        state.current = track
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS), volume=state.volume
-        )
-
-        def after(err):
-            if err:
-                log.error("Player error: %s", err)
-            asyncio.run_coroutine_threadsafe(self.play_next(guild), self.bot.loop)
-
-        vc.play(source, after=after)
-        if first is not None or not state.loop:
-            await self.announce(
-                state,
-                f"{header}Now playing: **{track.title}** [{fmt_duration(track.duration)}] "
-                f"(requested by {track.requester})",
-                first,
-            )
+            first = None
+            try:
+                first = await send(f"Loading karaoke **{track.title}**...")
+            except discord.HTTPException:
+                log.warning("Could not announce loading karaoke", exc_info=True)
+            await self.play_next(interaction.guild, first)
+        return True
 
     async def play_join_sound(self, vc: discord.VoiceClient):
         """Finish the local arrival clip before /play starts using the audio player."""
-        if not self.join_sound_enabled.get(str(vc.guild.id), True):
+        if not self.bot.features.enabled(vc.guild.id, "join_sound"):
             return
         if not self.join_sound_file.is_file():
             log.warning("Join sound file not found: %s; continuing without it", self.join_sound_file)
@@ -268,6 +373,9 @@ class Music(commands.Cog):
 
         After a public defer() Discord ignores ephemeral on the first reply, so the "thinking..."
         message is deleted first and the error goes out as a fresh ephemeral follow-up."""
+        if interaction.is_expired():
+            await interaction.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+            return
         try:
             await interaction.delete_original_response()
         except discord.HTTPException:
@@ -285,20 +393,16 @@ class Music(commands.Cog):
             return await interaction.response.send_message(
                 "You need Manage Channels to change the join sound.", ephemeral=True
             )
-        guild_id = str(interaction.guild.id)
+        guild_id = interaction.guild.id
         if enabled is None:
-            enabled = not self.join_sound_enabled.get(guild_id, True)
-        settings = {**self.join_sound_enabled, guild_id: enabled}
+            enabled = not self.bot.features.enabled(guild_id, "join_sound")
         try:
-            self.join_sound_settings_file.write_text(
-                json.dumps(settings, indent=2), encoding="utf-8"
-            )
+            self.bot.features.set_enabled(guild_id, "join_sound", enabled)
         except OSError:
             log.exception("Couldn't save join sound settings")
             return await interaction.response.send_message(
                 "Couldn't save the setting; nothing changed. Check the console.", ephemeral=True
             )
-        self.join_sound_enabled = settings
         text = f"Join sound is now **{'on' if enabled else 'off'}** for this server."
         if enabled and not self.join_sound_file.is_file():
             text += f" Add your audio file at `{self.join_sound_file}` before the next join."
@@ -317,6 +421,8 @@ class Music(commands.Cog):
         except Exception as e:
             log.warning("Lookup failed for %r: %s", query, e)
             return await self.fail(interaction, "Couldn't find anything for that.")
+        if not self.bot.features.enabled(interaction.guild.id, "music"):
+            return await self.fail(interaction, "Music was disabled while looking up this song.")
 
         track = Track(
             title=info.get("title", "Unknown"),
@@ -365,6 +471,8 @@ class Music(commands.Cog):
             )
         if not tracks:
             return await self.fail(interaction, "Couldn't find any playable songs in that playlist.")
+        if not self.bot.features.enabled(interaction.guild.id, "music"):
+            return await self.fail(interaction, "Music was disabled while looking up this playlist.")
 
         state = self.state(interaction.guild)
         state.text_channel = interaction.channel
@@ -440,13 +548,27 @@ class Music(commands.Cog):
     @app_commands.command(name="stop", description="Stop playback and clear the queue")
     @app_commands.guild_only()
     async def stop(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         vc = interaction.guild.voice_client
         state = self.state(interaction.guild)
+        # Invalidate callbacks before stop can schedule the next track.
+        tracks = list(state.queue)
+        if state.current:
+            tracks.append(state.current)
         state.queue.clear()
+        state.current = None
         state.loop = False
-        if vc and (vc.is_playing() or vc.is_paused()):
+        if state.idle_task:
+            state.idle_task.cancel()
+        if vc:
             vc.stop()
-        await interaction.response.send_message("Stopped and cleared the queue.")
+            if vc.source:
+                vc.source.cleanup()
+        for track in tracks:
+            if track.karaoke:
+                await track.karaoke.finish("Stopped")
+        state.idle_task = asyncio.create_task(self.leave_after_idle(interaction.guild))
+        await interaction.followup.send("Stopped and cleared the queue.")
 
     @app_commands.command(name="leave", description="Disconnect from voice")
     @app_commands.guild_only()
@@ -454,9 +576,9 @@ class Music(commands.Cog):
         vc = interaction.guild.voice_client
         if vc is None:
             return await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
-        self.states.pop(interaction.guild.id, None)
-        await vc.disconnect()
-        await interaction.response.send_message("Bye!")
+        await interaction.response.defer()
+        await self.disconnect(interaction.guild)
+        await interaction.followup.send("Bye!")
 
     @app_commands.command(name="queue", description="Show the queue")
     @app_commands.guild_only()
@@ -515,12 +637,24 @@ class Music(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         """Leave when everyone else has left the channel."""
+        if self.bot.user and member.id == self.bot.user.id and before.channel and not after.channel:
+            state = self.states.pop(member.guild.id, None)
+            if state:
+                await self.clear_tracks(state, "Disconnected")
+            return
         vc = member.guild.voice_client
         if vc is None or vc.channel is None:
             return
         if not any(not m.bot for m in vc.channel.members):
-            self.states.pop(member.guild.id, None)
-            await vc.disconnect()
+            await self.disconnect(member.guild, "Everyone left")
+
+    async def cog_unload(self):
+        for guild_id in list(self.states):
+            guild = self.bot.get_guild(guild_id)
+            if guild:
+                await self.disconnect(guild, "Bot shutting down")
+            else:
+                await self.clear_tracks(self.states.pop(guild_id), "Bot shutting down")
 
 
 async def setup(bot: commands.Bot):

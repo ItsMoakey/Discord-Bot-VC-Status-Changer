@@ -43,8 +43,7 @@ def looks_like_emoji(text: str) -> bool:
 
 
 def has_manage_channels(interaction: discord.Interaction) -> bool:
-    member = interaction.guild.get_member(interaction.user.id)
-    return bool(member and member.guild_permissions.manage_channels)
+    return bool(interaction.guild and interaction.permissions.manage_channels)
 
 
 class VCStatus(commands.Cog):
@@ -97,14 +96,37 @@ class VCStatus(commands.Cog):
             return ok
 
     async def refresh_channel(self, channel: discord.abc.GuildChannel):
+        if not self.bot.features.enabled(channel.guild.id, "vc_status"):
+            return True
         if channel.id in self.disabled_channels:
+            return True
+        return await self.update_channel_status(channel, self.pick_status_for(channel))
+
+    async def on_feature_toggle(self, guild: discord.Guild, feature: str, enabled: bool):
+        if feature != "vc_status":
             return
-        await self.update_channel_status(channel, self.pick_status_for(channel))
+        failed = False
+        for channel in (*guild.voice_channels, *guild.stage_channels):
+            if channel.id in self.disabled_channels:
+                continue
+            try:
+                if enabled:
+                    ok = await self.refresh_channel(channel)
+                else:
+                    ok = await self.update_channel_status(channel, EMPTY_STATUS)
+                failed = not ok or failed
+            except Exception:
+                failed = True
+                log.exception("Could not update status for channel %s after feature toggle", channel.id)
+        if failed:
+            raise RuntimeError("Some voice channel statuses could not be updated")
 
     # ---------- listeners ----------
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
+        if not self.bot.features.enabled(member.guild.id, "vc_status"):
+            return
         to_refresh = set()
         if before.channel and before.channel != after.channel:
             to_refresh.add(before.channel)
@@ -210,6 +232,10 @@ class VCStatus(commands.Cog):
     @app_commands.default_permissions(manage_channels=True)
     @app_commands.guild_only()
     async def vcstatus(self, interaction: discord.Interaction, channel: discord.VoiceChannel):
+        if not has_manage_channels(interaction):
+            return await interaction.response.send_message(
+                "You need Manage Channels to refresh a voice channel's status.", ephemeral=True,
+            )
         status = self.pick_status_for(channel)
         if await self.update_channel_status(channel, status):
             label = readable_emoji(status) if status else "(cleared)"
@@ -225,6 +251,10 @@ class VCStatus(commands.Cog):
     @app_commands.default_permissions(manage_channels=True)
     @app_commands.guild_only()
     async def vctoggle(self, interaction: discord.Interaction):
+        if not has_manage_channels(interaction):
+            return await interaction.response.send_message(
+                "You need Manage Channels to pause or resume voice channel statuses.", ephemeral=True,
+            )
         member = interaction.guild.get_member(interaction.user.id)
         if not member or not member.voice or not member.voice.channel:
             return await interaction.response.send_message(

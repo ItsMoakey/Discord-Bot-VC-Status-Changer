@@ -5,9 +5,11 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from cogs.features import FeatureStore, FeatureTree
+
 ## A Discord bot that updates voice channel statuses to show custom emojis for who's currently in them,
 ## re-posts Instagram links through an embed proxy, and plays music in voice channels.
-## Each feature is a cog in ./cogs, loaded below. Remove a line from EXTENSIONS to turn a feature off.
+## Each feature is a cog in ./cogs; use /toggle to configure features per server.
 ## Set the token as DISCORD_TOKEN in your environment or in a .env file (see .env.example).
 
 load_dotenv()
@@ -15,9 +17,11 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("bot")
 
 EXTENSIONS = [
+    "cogs.features",
     "cogs.vc_status",
     "cogs.instagram_embed",
     "cogs.music",
+    "cogs.karaoke",
 ]
 
 
@@ -27,7 +31,8 @@ class Bot(commands.Bot):
         intents.voice_states = True
         intents.members = True          # privileged: enable "Server Members Intent" in the Developer Portal
         intents.message_content = True  # privileged: enable "Message Content Intent" (Instagram links)
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=FeatureTree)
+        self.features = FeatureStore()
 
     async def setup_hook(self):
         for ext in EXTENSIONS:

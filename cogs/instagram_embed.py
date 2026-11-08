@@ -41,6 +41,8 @@ class InstagramEmbed(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
+        if not self.bot.features.enabled(message.guild.id, "instagram"):
+            return
         urls = find_instagram_embeds(message.content)
         if not urls:
             return
