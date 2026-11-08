@@ -1,4 +1,6 @@
-discord.py[voice]>=2.4
+discord.py[voice]==2.7.1
+# Keep the verified DAVE encryption backend paired with discord.py.
+davey==0.1.0
 yt-dlp
 python-dotenv
 PyNaCl

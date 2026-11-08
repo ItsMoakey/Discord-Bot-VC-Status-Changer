@@ -67,6 +67,8 @@ The clip uses the music player's current volume and requires FFmpeg, **Connect**
 
 `/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals using Demucs's `htdemucs` model on CPU. The resulting `no_vocals.wav` uses the existing music queue, volume, pause/resume, skip, stop, and loop controls. Only use audio you have permission to download and process.
 
+Stock Demucs/PyTorch does not use Vulkan for inference. AMD GPU acceleration requires a supported ROCm GPU/OS stack, not just a Vulkan driver. The homelab's Radeon 820M (GFX1153) on Debian 13 currently runs separation on CPU; no unsupported GPU override is enabled.
+
 - LRCLIB is searched for matching lyrics. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
 - If no matching lyrics are found or the lyrics service is unavailable, the instrumental still plays with an explanatory message. Vocal-separation failure never falls back to the original vocal audio.
@@ -89,6 +91,8 @@ On other platforms, create the environment with `python3.11 -m venv .venv-karaok
 
 
 ### Setup
+
+The Discord voice dependencies are pinned as a tested pair (`discord.py 2.7.1` and `davey 0.1.0`). With `davey 0.2.0`, live testing found that DAVE negotiation never became ready and playback was silent despite valid PCM and outgoing UDP packets. Keep the pair pinned when reinstalling.
 
 1. In the Developer Portal, enable the **Server Members Intent** and **Message Content Intent**.
 2. Invite the bot with the `bot` and `applications.commands` scopes and the permissions above (View Channels, Send Messages, Embed Links, Manage Messages, Manage Channels, Connect, Speak).
