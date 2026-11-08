@@ -1,4 +1,4 @@
-"""Optional CPU Demucs karaoke, with cancellable preparation and LRCLIB lyrics."""
+"""Optional Demucs karaoke, with cancellable preparation and LRCLIB lyrics."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import tempfile
 import threading
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -26,6 +25,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.music import Track
+from cogs.messages import PublicMessageError
 
 log = logging.getLogger("musicbot.karaoke")
 LRCLIB_URL = "https://lrclib.net/api/search"
@@ -340,7 +340,8 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
                 "Instrumental separation failed. Run the bot in Python 3.11 with requirements.txt and "
                 "requirements-karaoke.txt installed, and ensure FFmpeg is on PATH. "
                 "The first htdemucs run downloads model weights and needs internet access "
-                "and free disk/RAM. Check the console for the actual Demucs error; the original vocals were not played."
+                "and free disk/RAM. Check KARAOKE_DEVICE and the console for the actual Demucs/backend error; "
+                "cuda requires compatible CUDA/ROCm PyTorch and drivers (Vulkan is unsupported). The original vocals were not played."
             )
         if stage == "ffmpeg":
             raise PreparationError("FFmpeg could not decode this audio. Check the bot's FFmpeg installation and console error.")
@@ -348,6 +349,21 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
             "YouTube audio could not be downloaded. The video may be private, restricted, live, or unavailable; "
             "check the console and update yt-dlp if YouTube extraction is failing."
         )
+DEMUCS_WORKER = r'''
+import os, sys
+import torch
+from demucs.separate import main
+requested = os.getenv("KARAOKE_DEVICE", "auto").strip().lower()
+if requested not in {"auto", "cpu", "cuda"}:
+    raise SystemExit("KARAOKE_DEVICE must be auto, cpu, or cuda. Vulkan is not a PyTorch Demucs backend; use a compatible CUDA/ROCm PyTorch installation.")
+available = torch.cuda.is_available()
+if requested == "cuda" and not available:
+    raise SystemExit("KARAOKE_DEVICE=cuda requires a compatible CUDA/ROCm PyTorch installation and GPU driver; no CPU fallback was attempted.")
+device = "cuda" if requested == "cuda" or (requested == "auto" and available) else "cpu"
+print(f"Demucs backend: {device}; requested={requested}; torch={torch.__version__}; HIP={torch.version.hip}", flush=True)
+main(["--two-stems", "vocals", "-n", "htdemucs", "--device", device, "--out", sys.argv[1], sys.argv[2]])
+'''
+
 
 
 async def prepare_audio(url: str, root: Path) -> tuple[dict, str]:
@@ -362,8 +378,7 @@ async def prepare_audio(url: str, root: Path) -> tuple[dict, str]:
         "-i", str(source), "-vn", "-ar", "44100", "-ac", "2", str(wav),
     ], root, "ffmpeg")
     await run_process([
-        sys.executable, "-m", "demucs", "--two-stems", "vocals", "-n", "htdemucs",
-        "--device", "cpu", "--out", str(root / "stems"), str(wav),
+        sys.executable, "-c", DEMUCS_WORKER, str(root / "stems"), str(wav),
     ], root, "demucs")
     instrumental = root / "stems" / "htdemucs" / "input" / "no_vocals.wav"
     if not instrumental.is_file() or instrumental.stat().st_size <= 44:
@@ -407,6 +422,7 @@ class LyricsView(discord.ui.View):
         self.next_page.disabled = session.finished or session.live or session.page >= len(session.pages) - 1
         self.mode.disabled = session.finished or not bool(session.lyrics.synced)
         self.mode.label = "Full lyrics" if session.live else "Live lyrics"
+        self.controls.disabled = session.finished
 
     async def change(self, interaction: discord.Interaction, direction: int | None) -> None:
         await interaction.response.defer()
@@ -418,7 +434,7 @@ class LyricsView(discord.ui.View):
             else:
                 self.session.page = max(0, min(len(self.session.pages) - 1, self.session.page + direction))
             self.refresh()
-            await interaction.edit_original_response(embed=self.session.embed(), view=self)
+            await self.session.interaction.client.messages.edit(self.session.message, embed=self.session.embed(), view=self)
 
     @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -431,6 +447,13 @@ class LyricsView(discord.ui.View):
     @discord.ui.button(label="Full lyrics", style=discord.ButtonStyle.primary)
     async def mode(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.change(interaction, None)
+
+    @discord.ui.button(label="Bring controls here", style=discord.ButtonStyle.secondary)
+    async def controls(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        music = interaction.client.get_cog("Music")
+        if music is None:
+            return await interaction.response.send_message("The music service is unavailable.", ephemeral=True)
+        await music.controls.callback(music, interaction)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
         log.warning("Lyric button failed: %s", error)
@@ -462,9 +485,6 @@ class KaraokeSession:
         self.reason = "Finished"
         self.notice = ""
         self.message: discord.Message | discord.WebhookMessage | None = None
-        self.webhook_message = True
-        self.handoff_at = interaction.expires_at - timedelta(seconds=90)
-        self.next_handoff_attempt = 0.0
         self.lock = asyncio.Lock()
         self.finish_lock = asyncio.Lock()
         self.view = LyricsView(self)
@@ -473,7 +493,7 @@ class KaraokeSession:
 
     def wrap_source(self, source: discord.AudioSource) -> discord.AudioSource:
         if source.is_opus():
-            raise TypeError("KaraokeSession requires PCM before PCMVolumeTransformer")
+            raise TypeError("KaraokeSession requires a decoded PCM source")
         if self.source:
             self.source.cleanup()
         self.pcm_bytes = 0
@@ -504,22 +524,9 @@ class KaraokeSession:
         return result
 
     async def publish(self) -> None:
-        try:
-            if self.interaction.is_expired():
-                if self.interaction.channel is None:
-                    raise PreparationError("The command expired and its text channel is unavailable.")
-                self.message = await self.interaction.channel.send(
-                    embed=self.embed(), view=self.view, allowed_mentions=discord.AllowedMentions.none(),
-                )
-                self.webhook_message = False
-            else:
-                self.message = await self.interaction.followup.send(
-                    embed=self.embed(), view=self.view, wait=True, allowed_mentions=discord.AllowedMentions.none(),
-                )
-        except discord.HTTPException:
-            # The audio remains usable if lyric presentation permissions/network fail.
-            log.warning("Couldn't publish karaoke lyrics; instrumental playback will continue", exc_info=True)
-        # A track may remain queued longer than a webhook's lifetime.
+        self.message = await self.interaction.client.messages.send(
+            self.interaction.channel, embed=self.embed(), view=self.view,
+        )
         self.updater = asyncio.create_task(self.update_loop())
 
     async def start(self) -> None:
@@ -531,48 +538,19 @@ class KaraokeSession:
             await asyncio.gather(self.updater, return_exceptions=True)
         self.updater = asyncio.create_task(self.update_loop())
 
-    async def handoff_if_needed(self) -> None:
-        if not self.webhook_message or discord.utils.utcnow() < self.handoff_at:
-            return
-        now = asyncio.get_running_loop().time()
-        if now < self.next_handoff_attempt:
-            return
-        self.next_handoff_attempt = now + 30
-        channel = self.interaction.channel
-        if channel is None:
-            return
-        try:
-            new_message = await channel.send(
-                embed=self.embed(), view=self.view, allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException as error:
-            self.notice = "Send Messages permission is needed to continue lyrics after 15 minutes"
-            log.warning("Cannot hand off karaoke lyrics to bot channel message: %s", error)
-            return
-        old_message = self.message
-        self.message = new_message
-        self.webhook_message = False
-        self.notice = ""
-        if old_message:
-            try:
-                await old_message.edit(content="Lyrics continue in the newer message below.", embed=None, view=None)
-            except discord.HTTPException:
-                pass
-
     async def update_loop(self) -> None:
         previous = None
         try:
             while not self.finished:
                 async with self.lock:
-                    await self.handoff_if_needed()
                     rendered = self.embed()
                     signature = rendered.to_dict()
                     if self.message and signature != previous:
                         self.view.refresh()
                         try:
-                            await self.message.edit(embed=rendered, view=self.view, allowed_mentions=discord.AllowedMentions.none())
+                            await self.interaction.client.messages.edit(self.message, embed=rendered, view=self.view)
                             previous = signature
-                        except discord.HTTPException as error:
+                        except PublicMessageError as error:
                             log.info("Couldn't update karaoke lyrics: %s", error)
                 await asyncio.sleep(2.1)
         except asyncio.CancelledError:
@@ -593,11 +571,10 @@ class KaraokeSession:
                     await asyncio.gather(self.updater, return_exceptions=True)
                 async with self.lock:
                     self.view.refresh()
-                    await self.handoff_if_needed()
                     if self.message:
                         try:
-                            await self.message.edit(embed=self.embed(), view=self.view, allowed_mentions=discord.AllowedMentions.none())
-                        except discord.HTTPException:
+                            await self.interaction.client.messages.edit(self.message, embed=self.embed(), view=self.view)
+                        except PublicMessageError:
                             log.info("Couldn't disable terminal lyric controls", exc_info=True)
             finally:
                 self.view.stop()
@@ -610,63 +587,34 @@ class KaraokeSession:
 
 
 class PreparationProgress:
-    """Hand long-running preparation off before the original interaction expires."""
+    """One durable webhook message for the entire preparation lifecycle."""
 
     def __init__(self, interaction: discord.Interaction):
         self.interaction = interaction
-        self.message: discord.Message | None = None
-        self.text = "Preparing karaoke…"
-        self.lock = asyncio.Lock()
-        self.task = asyncio.create_task(self.handoff_later())
-
-    async def handoff_locked(self) -> None:
-        if self.message is not None or self.interaction.channel is None:
-            return
-        self.message = await self.interaction.channel.send(
-            self.text, allowed_mentions=discord.AllowedMentions.none(),
-        )
-        if not self.interaction.is_expired():
-            try:
-                await self.interaction.edit_original_response(content="Karaoke preparation continues in the newer message below.")
-            except discord.HTTPException:
-                pass
-
-    async def handoff_later(self) -> None:
-        delay = (self.interaction.expires_at - timedelta(seconds=90) - discord.utils.utcnow()).total_seconds()
-        await asyncio.sleep(max(0, delay))
-        try:
-            async with self.lock:
-                await self.handoff_locked()
-        except discord.HTTPException:
-            log.warning("Couldn't hand off long karaoke preparation progress; check Send Messages permission", exc_info=True)
+        self.message: discord.WebhookMessage | None = None
 
     async def update(self, text: str) -> None:
-        async with self.lock:
-            self.text = text
+        messages = self.interaction.client.messages
+        if self.message is None:
+            self.message = await messages.send(self.interaction.channel, text)
             try:
-                if self.message:
-                    await self.message.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
-                elif self.interaction.is_expired():
-                    await self.handoff_locked()
-                else:
-                    await self.interaction.edit_original_response(content=text)
+                await self.interaction.delete_original_response()
             except discord.HTTPException:
-                log.info("Couldn't update karaoke preparation progress", exc_info=True)
+                pass
+        else:
+            self.message = await messages.edit(self.message, text)
 
     async def finish(self, accepted: bool) -> None:
-        self.task.cancel()
-        await asyncio.gather(self.task, return_exceptions=True)
+        if self.message is None:
+            return
         text = (
             "Instrumental preparation complete; see the playback/queue and lyrics messages."
             if accepted else "Karaoke preparation ended without queueing audio; see the command error."
         )
-        if self.message:
-            try:
-                await self.message.edit(content=text)
-            except discord.HTTPException:
-                pass
-        elif accepted:
-            await self.update(text)
+        try:
+            await self.interaction.client.messages.edit(self.message, text)
+        except PublicMessageError:
+            log.warning("Couldn't finalize karaoke preparation progress", exc_info=True)
 
 
 class Karaoke(commands.Cog):
@@ -688,13 +636,18 @@ class Karaoke(commands.Cog):
         voice = getattr(interaction.user, "voice", None)
         if not voice or not voice.channel:
             return await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
+        active_voice = guild.voice_client
+        if active_voice and active_voice.channel != voice.channel:
+            return await self.bot.messages.reply(
+                interaction, "Join my voice channel to prepare karaoke.", ephemeral=True,
+            )
         try:
             url = youtube_video_url(url)
         except PreparationError as error:
             return await interaction.response.send_message(str(error), ephemeral=True)
         if guild.id in self.preparations:
             return await interaction.response.send_message("A karaoke track is already being prepared for this server. Please wait.", ephemeral=True)
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         task = asyncio.current_task()
         # No await between the duplicate check and registration after defer: another request
         # may have entered during defer, so check once more before taking ownership.
@@ -707,14 +660,14 @@ class Karaoke(commands.Cog):
         progress = PreparationProgress(interaction)
         try:
             await progress.update(
-                "Waiting for the karaoke preparation worker. Vocal removal runs on CPU and can take several minutes; "
+                "Waiting for the karaoke preparation worker. Vocal removal can take several minutes; "
                 "the first run also downloads the htdemucs model. The original vocal audio will never be used as a fallback."
             )
             async with self.heavy_jobs:
                 if not self.bot.features.enabled(guild.id, "karaoke"):
                     raise PreparationError("Karaoke was disabled before preparation could start.")
                 temporary = tempfile.TemporaryDirectory(prefix="discord-karaoke-")
-                await progress.update("Downloading YouTube audio and preparing the instrumental with Demucs on CPU…")
+                await progress.update("Downloading YouTube audio and preparing the instrumental with Demucs; backend selection is recorded in the worker log…")
                 info, audio_path = await prepare_audio(url, Path(temporary.name))
             if not self.bot.features.enabled(guild.id, "karaoke"):
                 raise PreparationError("Karaoke was disabled while this track was being prepared.")
@@ -737,7 +690,7 @@ class Karaoke(commands.Cog):
             except discord.HTTPException:
                 pass
             raise
-        except PreparationError as error:
+        except (PreparationError, PublicMessageError) as error:
             await music.fail(interaction, str(error))
         except discord.HTTPException:
             log.exception("Karaoke Discord message/voice operation failed")

@@ -4,3 +4,5 @@
 torch==2.5.1
 torchaudio==2.5.1
 demucs==4.0.1
+# WAV loading/saving for torchaudio, including installations using standalone FFmpeg.
+soundfile>=0.12

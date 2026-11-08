@@ -130,19 +130,63 @@ class FeatureTree(app_commands.CommandTree):
         return allowed
 
 
+class FeatureToggleButton(discord.ui.Button):
+    def __init__(self, key: str, label: str, enabled: bool):
+        super().__init__(
+            label=f"{label}: {'on' if enabled else 'off'}",
+            style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary,
+            custom_id=f"features:{key}",
+        )
+        self.feature = key
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.cog.set_feature(interaction, self.feature)
+
+
+class FeatureSettingsView(discord.ui.View):
+    def __init__(self, cog, guild_id: int):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.guild_id = guild_id
+        for key, label in FEATURE_LABELS.items():
+            self.add_item(FeatureToggleButton(
+                key, label, cog.bot.features.enabled(guild_id, key)
+            ))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id != self.guild_id:
+            await interaction.response.send_message("This panel belongs to another server.", ephemeral=True)
+            return False
+        if not interaction.permissions.manage_guild:
+            await interaction.response.send_message(
+                "You need Manage Server to change feature settings.", ephemeral=True,
+            )
+            return False
+        return True
+
+
 class Features(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._toggle_locks: dict[int, asyncio.Lock] = {}
 
-    @app_commands.command(name="features", description="Show this server's feature settings")
+    def status_embed(self, guild_id: int) -> discord.Embed:
+        embed = discord.Embed(title="Server features", color=discord.Color.blurple())
+        for key, label in FEATURE_LABELS.items():
+            embed.add_field(
+                name=label, value="On" if self.bot.features.enabled(guild_id, key) else "Off",
+                inline=True,
+            )
+        embed.set_footer(text="Manage Server is required to change settings.")
+        return embed
+
+    @app_commands.command(name="features", description="Show this server's feature settings and toggle buttons")
     @app_commands.guild_only()
     async def features(self, interaction: discord.Interaction):
-        lines = [
-            f"**{label}:** {'on' if self.bot.features.enabled(interaction.guild_id, key) else 'off'}"
-            for key, label in FEATURE_LABELS.items()
-        ]
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        view = FeatureSettingsView(self, interaction.guild_id) if interaction.permissions.manage_guild else None
+        await self.bot.messages.reply(
+            interaction, embed=self.status_embed(interaction.guild_id), view=view, ephemeral=True,
+        )
 
     @app_commands.command(name="toggle", description="Enable or disable a system for this server")
     @app_commands.describe(
@@ -157,6 +201,9 @@ class Features(commands.Cog):
         self, interaction: discord.Interaction, system: app_commands.Choice[str],
         enabled: bool | None = None,
     ):
+        await self.set_feature(interaction, system.value, enabled)
+
+    async def set_feature(self, interaction: discord.Interaction, feature: str, enabled: bool | None = None):
         if not interaction.permissions.manage_guild:
             return await interaction.response.send_message(
                 "You need Manage Server to change feature settings.", ephemeral=True,
@@ -165,7 +212,8 @@ class Features(commands.Cog):
         guild_id = interaction.guild_id
         lock = self._toggle_locks.setdefault(guild_id, asyncio.Lock())
         async with lock:
-            feature = system.value
+            if feature not in FEATURE_LABELS:
+                return await interaction.followup.send("Unknown feature.", ephemeral=True)
             value = not self.bot.features.enabled(guild_id, feature) if enabled is None else enabled
             try:
                 self.bot.features.set_enabled(guild_id, feature, value)
@@ -190,7 +238,12 @@ class Features(commands.Cog):
                     " The setting was saved, but an immediate effect failed; "
                     "existing activity may not fully reflect it yet. Check the bot logs."
                 )
-            await interaction.followup.send(text, ephemeral=True)
+            if interaction.type is discord.InteractionType.component:
+                await interaction.edit_original_response(
+                    embed=self.status_embed(guild_id),
+                    view=FeatureSettingsView(self, guild_id),
+                )
+            await self.bot.messages.reply(interaction, text, ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

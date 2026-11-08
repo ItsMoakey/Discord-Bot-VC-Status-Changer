@@ -5,6 +5,8 @@ import re
 import discord
 from discord.ext import commands
 
+from cogs.messages import PublicMessageError
+
 log = logging.getLogger("instagram_embed")
 
 # Instagram no longer embeds in Discord, so posted links are re-posted with the host swapped
@@ -47,9 +49,9 @@ class InstagramEmbed(commands.Cog):
         if not urls:
             return
         try:
-            await message.reply("\n".join(urls), mention_author=False)
-        except discord.HTTPException as e:
-            log.warning("couldn't post Instagram embed in #%s: %s", message.channel, e)
+            await self.bot.messages.send(message.channel, "\n".join(urls), raw=True)
+        except PublicMessageError as e:
+            log.warning("Couldn't post Instagram webhook in #%s: %s", message.channel, e)
             return
         # hide Instagram's own (empty) preview so the embed isn't doubled; needs Manage Messages
         try:

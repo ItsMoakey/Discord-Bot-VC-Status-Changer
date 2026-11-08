@@ -1,8 +1,10 @@
 import asyncio
+import json
 from typing import TYPE_CHECKING
 import logging
 import os
 import random
+import tempfile
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,9 @@ import discord
 import yt_dlp
 from discord import app_commands
 from discord.ext import commands
+
+from cogs.messages import PublicMessageError
+from cogs.music_controls import PlaybackInput, PlaybackView
 
 if TYPE_CHECKING:
     from cogs.karaoke import KaraokeSession
@@ -101,10 +106,10 @@ class GuildState:
         self.queue: deque[Track] = deque()
         self.current: Track | None = None
         self.loop = False
-        self.volume = 0.5
         self.text_channel: discord.abc.Messageable | None = None
         self.idle_task: asyncio.Task | None = None
-        self.np_id: int | None = None  # id of our latest "Now playing" message, so we can edit it
+        self.panel: discord.WebhookMessage | None = None
+        self.notice = ""
 
 
 class Music(commands.Cog):
@@ -114,6 +119,142 @@ class Music(commands.Cog):
         self.join_sound_file = Path(os.getenv("JOIN_SOUND_FILE") or "join.mp3")
         self.voice_locks: dict[int, asyncio.Lock] = {}
         self.play_locks: dict[int, asyncio.Lock] = {}
+        self.panel_locks: dict[int, asyncio.Lock] = {}
+        self.playback_view = PlaybackView()
+        self.panel_file = Path(os.getenv("PLAYBACK_PANEL_FILE") or "playback_panels.json")
+        try:
+            self.panel_refs = json.loads(self.panel_file.read_text(encoding="utf-8")) if self.panel_file.exists() else {}
+        except (OSError, ValueError):
+            log.exception("Couldn't load saved playback panel references")
+            self.panel_refs = {}
+
+    async def restore_panel(self, guild, state):
+        reference = self.panel_refs.get(str(guild.id))
+        if state.panel is not None or not reference:
+            return
+        try:
+            channel = self.bot.get_channel(reference["channel_id"]) or await self.bot.fetch_channel(reference["channel_id"])
+            if channel.guild.id != guild.id:
+                return
+            _, hook = await self.bot.messages.webhook(channel)
+            kwargs = {"thread": channel} if isinstance(channel, discord.Thread) else {}
+            state.panel = await hook.fetch_message(reference["message_id"], **kwargs)
+            if state.text_channel is None:
+                state.text_channel = channel
+        except (discord.HTTPException, PublicMessageError, KeyError, TypeError):
+            log.info("Saved playback panel is unavailable for guild %s", guild.id)
+
+    def remember_panel(self, guild_id, panel):
+        reference = {"channel_id": panel.channel.id, "message_id": panel.id}
+        if self.panel_refs.get(str(guild_id)) == reference:
+            return
+        references = {**self.panel_refs, str(guild_id): reference}
+        self.panel_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.panel_file.parent,
+                prefix=f".{self.panel_file.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary = stream.name
+                json.dump(references, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.panel_file)
+            temporary = None
+            self.panel_refs = references
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+
+    async def cog_load(self):
+        self.bot.add_view(self.playback_view)
+
+    async def control_guard(
+        self, interaction: discord.Interaction, *, feature: str | None = None,
+        mutation: bool = True, allow_disconnected: bool = False,
+    ) -> bool:
+        guild = interaction.guild
+        if guild is None:
+            await self.fail(interaction, "Playback controls are only available in a server.")
+            return False
+        enabled = self.bot.features.enabled
+        allowed = enabled(guild.id, feature) if feature else (
+            enabled(guild.id, "music") or enabled(guild.id, "karaoke")
+        )
+        if not allowed:
+            await self.fail(interaction, f"{feature.capitalize() if feature else 'Music and karaoke'} is disabled. A member with Manage Server can enable it with `/toggle`.")
+            return False
+        if not mutation:
+            return True
+        voice = getattr(interaction.user, "voice", None)
+        vc = guild.voice_client
+        if not voice or not voice.channel:
+            await self.fail(interaction, "Join my voice channel before changing playback.")
+            return False
+        if vc is None:
+            if allow_disconnected:
+                return True
+            await self.fail(interaction, "I'm not in a voice channel. Use Play or Karaoke to start.")
+            return False
+        if vc.channel != voice.channel:
+            await self.fail(interaction, "You must be in my voice channel to change playback.")
+            return False
+        return True
+
+    async def defer(self, interaction: discord.Interaction):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+    async def dispatch_control(self, interaction: discord.Interaction, action: str):
+        if action in {"play", "karaoke"}:
+            feature = "music" if action == "play" else "karaoke"
+            if await self.control_guard(interaction, feature=feature, allow_disconnected=True):
+                await interaction.response.send_modal(PlaybackInput(karaoke=action == "karaoke"))
+            return
+        if not await self.control_guard(interaction, mutation=action not in {"queue", "controls"}):
+            return
+        await self.defer(interaction)
+        if action == "pause_resume":
+            vc = interaction.guild.voice_client
+            action = "resume" if vc and vc.is_paused() else "pause"
+        command = getattr(self, action)
+        await command.callback(self, interaction)
+
+    def dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
+        return self.panel_embed(guild, self.state(guild))
+
+    def panel_embed(self, guild: discord.Guild, state: GuildState) -> discord.Embed:
+        vc = guild.voice_client
+        active = vc and (vc.is_playing() or vc.is_paused())
+        status = "Disconnected" if vc is None else (
+            "Paused" if vc.is_paused() else "Now playing" if active else "Idle"
+        )
+        lines = []
+        if state.notice:
+            lines.append(state.notice)
+        if active and state.current:
+            track = state.current
+            lines.append(f"**{track.title}** [{fmt_duration(track.duration)}]\nRequested by {track.requester}")
+        elif not active:
+            lines.append("Use Play or Karaoke to add a song.")
+        embed = discord.Embed(title=f"Playback · {status}", description="\n\n".join(lines)[:4096])
+        embed.add_field(name="Loop", value="On" if state.loop else "Off")
+        embed.add_field(name="Queued", value=str(len(state.queue)))
+        if vc and vc.channel:
+            embed.set_footer(text=f"Voice: {vc.channel.name}")
+        return embed
+
+    async def refresh_panel(self, guild: discord.Guild, state: GuildState | None = None):
+        state = state or self.states.get(guild.id)
+        if state is None or state.panel is None:
+            return
+        try:
+            await self.bot.messages.edit(
+                state.panel, embed=self.panel_embed(guild, state), view=self.playback_view
+            )
+        except PublicMessageError as error:
+            log.warning("Couldn't refresh playback panel: %s", error)
 
     def state(self, guild: discord.Guild) -> GuildState:
         return self.states.setdefault(guild.id, GuildState())
@@ -127,36 +268,50 @@ class Music(commands.Cog):
         state = self.states.get(guild.id)
         if vc is None or vc.is_playing() or vc.is_paused() or (state and state.queue):
             return
-        self.states.pop(guild.id, None)
-        await vc.disconnect()
+        if state:
+            state.idle_task = None
+        await self.disconnect(guild)
 
     async def announce(self, state: GuildState, text: str, first: discord.WebhookMessage | None = None):
-        """Show the 'Now playing' text while keeping the channel tidy.
-
-        - `first`: the reply the command already posted ("Loading...", "Queued N songs..."), so the
-          loading and now-playing text end up in one message.
-        - otherwise, if our last "Now playing" message is still the newest message in the channel,
-          edit it instead of posting another one.
-        - otherwise post a new message.
-        """
+        """Keep one canonical panel, reusing it while songs change."""
         channel = state.text_channel
         if channel is None:
             return
-        try:
-            if first is not None:
-                await first.edit(content=text)
-                state.np_id = first.id
+        async with self.panel_locks.setdefault(channel.guild.id, asyncio.Lock()):
+            await self.restore_panel(channel.guild, state)
+            await self.update_panel(state, text, first)
+
+    async def update_panel(self, state: GuildState, text: str, first: discord.WebhookMessage | None):
+        channel = state.text_channel
+        state.notice = text
+        guild = channel.guild
+        previous = state.panel
+        panel = previous if previous and previous.channel.id == channel.id else first
+        if panel is not None:
+            try:
+                await self.bot.messages.edit(
+                    panel, embed=self.panel_embed(guild, state), view=self.playback_view
+                )
+            except PublicMessageError as error:
+                log.info("Couldn't edit playback panel: %s", error)
+                panel = None
+        if panel is None:
+            try:
+                panel = await self.bot.messages.send(
+                    channel, embed=self.panel_embed(guild, state), view=self.playback_view
+                )
+            except PublicMessageError as error:
+                log.warning("Couldn't publish playback panel: %s", error)
                 return
-            if state.np_id and getattr(channel, "last_message_id", None) == state.np_id:
-                await channel.get_partial_message(state.np_id).edit(content=text)
-                return
-        except discord.HTTPException as e:
-            log.info("Couldn't edit the now-playing message, sending a new one: %s", e)
-        try:
-            msg = await channel.send(text)
-            state.np_id = msg.id
-        except discord.HTTPException as e:
-            log.warning("Couldn't send the now-playing message: %s", e)
+        state.panel = panel
+        self.remember_panel(guild.id, panel)
+        obsolete = {message.id: message for message in (previous, first)
+                    if message is not None and message.id != panel.id}
+        for message in obsolete.values():
+            try:
+                await self.bot.messages.delete(message)
+            except PublicMessageError as error:
+                log.warning("Couldn't remove obsolete playback message: %s", error)
 
     async def play_next(
         self, guild: discord.Guild, first: discord.WebhookMessage | None = None,
@@ -185,10 +340,10 @@ class Music(commands.Cog):
                 vc = guild.voice_client
                 if vc is None:
                     await self.clear_tracks(state, "Disconnected")
+                    await self.refresh_panel(guild, state)
                     return
                 if track is None:
-                    if header:
-                        await self.announce(state, header.rstrip(), first)
+                    await self.announce(state, header.rstrip(), first)
                     state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
                     return
                 feature = "karaoke" if track.karaoke else "music"
@@ -201,14 +356,13 @@ class Music(commands.Cog):
                         track.karaoke.audio_path if track.karaoke else
                         await asyncio.to_thread(resolve_stream, track.webpage_url)
                     )
-                    # A stop, leave, or toggle may have happened during extraction.
+                    # A leave or feature toggle may have happened during extraction.
                     if self.states.get(guild.id) is not state or state.current is not track:
                         return
                     options = {"options": "-vn"} if track.karaoke else FFMPEG_OPTS
-                    audio = discord.FFmpegPCMAudio(stream_url, **options)
+                    source = discord.FFmpegPCMAudio(stream_url, **options)
                     if track.karaoke:
-                        audio = track.karaoke.wrap_source(audio)
-                    source = discord.PCMVolumeTransformer(audio, volume=state.volume)
+                        source = track.karaoke.wrap_source(source)
 
                     def after(err, played=track):
                         if err:
@@ -227,13 +381,7 @@ class Music(commands.Cog):
                     continue
                 if track.karaoke:
                     await track.karaoke.start()
-                if first is not None or not state.loop:
-                    await self.announce(
-                        state,
-                        f"{header}Now playing: **{track.title}** [{fmt_duration(track.duration)}] "
-                        f"(requested by {track.requester})",
-                        first,
-                    )
+                await self.announce(state, header.rstrip(), first)
                 return
 
     async def clear_tracks(self, state: GuildState, reason: str):
@@ -260,6 +408,8 @@ class Music(commands.Cog):
             await vc.disconnect()
         if state:
             await self.clear_tracks(state, reason)
+            state.notice = reason
+            await self.refresh_panel(guild, state)
 
     async def on_feature_toggle(self, guild: discord.Guild, feature: str, enabled: bool):
         if enabled or feature not in {"music", "karaoke"}:
@@ -283,34 +433,32 @@ class Music(commands.Cog):
             if vc and (vc.is_playing() or vc.is_paused()):
                 vc.stop()
             await self.play_next(guild, completed=current)
+        await self.refresh_panel(guild, state)
 
     async def enqueue_prepared(self, interaction: discord.Interaction, track: Track) -> bool:
-        if not self.bot.features.enabled(interaction.guild.id, "karaoke"):
-            await self.fail(interaction, "Karaoke was disabled while preparing this song.")
+        if not await self.control_guard(interaction, feature="karaoke", allow_disconnected=True):
             return False
-        voice = getattr(interaction.user, "voice", None)
-        if not voice or not voice.channel:
-            await self.fail(interaction, "Join a voice channel before starting karaoke.")
-            return False
+        voice = interaction.user.voice
         vc = await self.join_voice(interaction.guild, voice.channel)
-        if not self.bot.features.enabled(interaction.guild.id, "karaoke"):
-            await self.fail(interaction, "Karaoke is disabled for this server.")
+        if not await self.control_guard(interaction, feature="karaoke"):
+            return False
+        try:
+            first = await self.bot.messages.send(
+                interaction.channel,
+                f"{'Queued' if vc.is_playing() or vc.is_paused() else 'Loading'} karaoke: **{track.title}**",
+            )
+        except PublicMessageError as error:
+            await self.fail(interaction, str(error))
+            return False
+        if not await self.control_guard(interaction, feature="karaoke"):
             return False
         state = self.state(interaction.guild)
         state.text_channel = interaction.channel
+        vc = interaction.guild.voice_client
         state.queue.append(track)
-        send = interaction.channel.send if interaction.is_expired() else interaction.followup.send
         if vc.is_playing() or vc.is_paused():
-            try:
-                await send(f"Queued karaoke: **{track.title}** (position {len(state.queue)})")
-            except discord.HTTPException:
-                log.warning("Could not announce queued karaoke", exc_info=True)
+            await self.refresh_panel(interaction.guild, state)
         else:
-            first = None
-            try:
-                first = await send(f"Loading karaoke **{track.title}**...")
-            except discord.HTTPException:
-                log.warning("Could not announce loading karaoke", exc_info=True)
             await self.play_next(interaction.guild, first)
         return True
 
@@ -334,10 +482,7 @@ class Music(commands.Cog):
 
         source = None
         try:
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(str(self.join_sound_file), options="-vn"),
-                volume=self.state(vc.guild).volume,
-            )
+            source = discord.FFmpegPCMAudio(str(self.join_sound_file), options="-vn")
             vc.play(source, after=after)
         except (OSError, discord.ClientException) as e:
             if source is not None:
@@ -365,24 +510,55 @@ class Music(commands.Cog):
                     state.idle_task = None
                 await self.play_join_sound(vc)
             elif vc.channel != channel:
-                await vc.move_to(channel)
+                raise PublicMessageError("You must be in my voice channel to change playback.")
             return vc
 
     async def fail(self, interaction: discord.Interaction, text: str):
-        """Tell only the person who ran the command that something went wrong.
-
-        After a public defer() Discord ignores ephemeral on the first reply, so the "thinking..."
-        message is deleted first and the error goes out as a fresh ephemeral follow-up."""
-        if interaction.is_expired():
-            await interaction.channel.send(text, allowed_mentions=discord.AllowedMentions.none())
-            return
+        """Errors never become public, including after an interaction expires."""
         try:
-            await interaction.delete_original_response()
+            await self.bot.messages.reply(interaction, text, ephemeral=True)
         except discord.HTTPException:
-            pass
-        await interaction.followup.send(text, ephemeral=True)
+            log.warning("Couldn't deliver a private playback response: %s", text, exc_info=True)
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        original = getattr(error, "original", error)
+        if isinstance(original, PublicMessageError):
+            return await self.fail(interaction, str(original))
+        log.error("Music command failed", exc_info=(type(original), original, original.__traceback__))
+        await self.fail(interaction, "Couldn't complete playback. Check the bot's voice/webhook permissions and console.")
 
     # ---------- commands ----------
+    @app_commands.command(name="controls", description="Post a fresh playback dashboard")
+    @app_commands.guild_only()
+    async def controls(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction, mutation=False):
+            return
+        await self.defer(interaction)
+        async with self.panel_locks.setdefault(interaction.guild.id, asyncio.Lock()):
+            state = self.state(interaction.guild)
+            await self.restore_panel(interaction.guild, state)
+            previous = state.panel
+            source = getattr(interaction, "message", None)
+            source_is_panel = source is not None and any(
+                (getattr(component, "custom_id", None) or "").startswith("playback:")
+                for row in source.components for component in getattr(row, "children", [])
+            )
+            panel = await self.bot.messages.reply(
+                interaction, embed=self.dashboard_embed(interaction.guild), view=self.playback_view
+            )
+            if panel is not None:
+                state.text_channel = interaction.channel
+                state.panel = panel
+                self.remember_panel(interaction.guild.id, panel)
+                obsolete = {message.id: message for message in (
+                    previous, source if source_is_panel else None
+                ) if message is not None and message.id != panel.id}
+                for message in obsolete.values():
+                    try:
+                        await self.bot.messages.delete(message)
+                    except PublicMessageError as error:
+                        await self.fail(interaction, str(error))
+
 
     @app_commands.command(name="joinsound", description="Toggle the arrival sound for this server")
     @app_commands.describe(enabled="Turn it on or off; omit to toggle")
@@ -390,9 +566,7 @@ class Music(commands.Cog):
     @app_commands.guild_only()
     async def joinsound(self, interaction: discord.Interaction, enabled: bool | None = None):
         if not interaction.permissions.manage_channels:
-            return await interaction.response.send_message(
-                "You need Manage Channels to change the join sound.", ephemeral=True
-            )
+            return await self.fail(interaction, "You need Manage Channels to change the join sound.")
         guild_id = interaction.guild.id
         if enabled is None:
             enabled = not self.bot.features.enabled(guild_id, "join_sound")
@@ -400,29 +574,28 @@ class Music(commands.Cog):
             self.bot.features.set_enabled(guild_id, "join_sound", enabled)
         except OSError:
             log.exception("Couldn't save join sound settings")
-            return await interaction.response.send_message(
-                "Couldn't save the setting; nothing changed. Check the console.", ephemeral=True
-            )
+            return await self.fail(interaction, "Couldn't save the setting; nothing changed. Check the console.")
         text = f"Join sound is now **{'on' if enabled else 'off'}** for this server."
         if enabled and not self.join_sound_file.is_file():
             text += f" Add your audio file at `{self.join_sound_file}` before the next join."
-        await interaction.response.send_message(text, ephemeral=True)
+        await self.bot.messages.reply(interaction, text, ephemeral=True)
 
     async def enqueue(self, interaction: discord.Interaction, query: str):
-        voice = getattr(interaction.user, "voice", None)
-        if not voice or not voice.channel:
-            return await interaction.response.send_message("Join a voice channel first.", ephemeral=True)
-        await interaction.response.defer()
-        vc = await self.join_voice(interaction.guild, voice.channel)
+        if not await self.control_guard(interaction, feature="music", allow_disconnected=True):
+            return
+        await self.defer(interaction)
+        if not await self.control_guard(interaction, feature="music", allow_disconnected=True):
+            return
+        await self.join_voice(interaction.guild, interaction.user.voice.channel)
         if is_playlist_url(query):
-            return await self.enqueue_playlist(interaction, vc, query)
+            return await self.enqueue_playlist(interaction, query)
         try:
             info = await asyncio.to_thread(extract_info, query)
         except Exception as e:
             log.warning("Lookup failed for %r: %s", query, e)
             return await self.fail(interaction, "Couldn't find anything for that.")
-        if not self.bot.features.enabled(interaction.guild.id, "music"):
-            return await self.fail(interaction, "Music was disabled while looking up this song.")
+        if not await self.control_guard(interaction, feature="music"):
+            return
 
         track = Track(
             title=info.get("title", "Unknown"),
@@ -430,18 +603,7 @@ class Music(commands.Cog):
             duration=info.get("duration"),
             requester=interaction.user.display_name,
         )
-        state = self.state(interaction.guild)
-        state.text_channel = interaction.channel
-        state.queue.append(track)
-
-        if vc.is_playing() or vc.is_paused():
-            await interaction.followup.send(
-                f"Queued: **{track.title}** (position {len(state.queue)})"
-            )
-        else:
-            # this "Loading..." message is edited into the "Now playing" message, not followed by a second one
-            first = await interaction.followup.send(f"Loading **{track.title}**...")
-            await self.play_next(interaction.guild, first)
+        await self.enqueue_tracks(interaction, [track], f"Queued: **{track.title}**")
 
     @app_commands.command(name="play", description="Play a song from a URL or search term")
     @app_commands.describe(query="Song link, playlist link, or search words")
@@ -449,7 +611,33 @@ class Music(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str):
         await self.enqueue(interaction, query)
 
-    async def enqueue_playlist(self, interaction: discord.Interaction, vc: discord.VoiceClient, url: str):
+    async def enqueue_tracks(self, interaction: discord.Interaction, tracks: list[Track], header: str):
+        if not await self.control_guard(interaction, feature="music"):
+            return
+        vc = interaction.guild.voice_client
+        loading = not (vc.is_playing() or vc.is_paused())
+        first = await self.bot.messages.reply(interaction, header + "\nLoading..." if loading else header)
+        if first is None:
+            return
+        if not await self.control_guard(interaction, feature="music"):
+            return
+        state = self.state(interaction.guild)
+        state.text_channel = interaction.channel
+        state.queue.extend(tracks)
+        vc = interaction.guild.voice_client
+        active = vc.is_playing() or vc.is_paused()
+        if active:
+            if loading:
+                try:
+                    await self.bot.messages.edit(first, header)
+                except PublicMessageError as error:
+                    await self.fail(interaction, str(error))
+            await self.refresh_panel(interaction.guild, state)
+        else:
+            await self.play_next(interaction.guild, first)
+
+
+    async def enqueue_playlist(self, interaction: discord.Interaction, url: str):
         try:
             title, entries = await asyncio.to_thread(extract_playlist, url)
         except Exception as e:
@@ -471,23 +659,13 @@ class Music(commands.Cog):
             )
         if not tracks:
             return await self.fail(interaction, "Couldn't find any playable songs in that playlist.")
-        if not self.bot.features.enabled(interaction.guild.id, "music"):
-            return await self.fail(interaction, "Music was disabled while looking up this playlist.")
-
-        state = self.state(interaction.guild)
-        state.text_channel = interaction.channel
-        state.queue.extend(tracks)
+        if not await self.control_guard(interaction, feature="music"):
+            return
 
         header = f"Queued **{len(tracks)}** songs from **{title}**."
         if len(entries) >= MAX_PLAYLIST:
             header += f" (Limited to the first {MAX_PLAYLIST}.)"
-        header += "\n"
-        if vc.is_playing() or vc.is_paused():
-            await interaction.followup.send(header.rstrip())
-        else:
-            # one message: the "Queued..." line plus the first song's "Now playing" line
-            first = await interaction.followup.send(header + "Loading the first song...")
-            await self.play_next(interaction.guild, first, header)
+        await self.enqueue_tracks(interaction, tracks, header)
 
     @app_commands.command(name="move", description="Move a song already in the queue (default: to position 1, next up)")
     @app_commands.describe(position="Current position of the song in /queue", to="New position (default 1 = plays next)")
@@ -498,94 +676,84 @@ class Music(commands.Cog):
         position: app_commands.Range[int, 1],
         to: app_commands.Range[int, 1] = 1,
     ):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         state = self.state(interaction.guild)
         items = list(state.queue)
         if not items:
-            return await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return await self.fail(interaction, "The queue is empty.")
         if position > len(items):
-            return await interaction.response.send_message(
-                f"There's no song at position {position} (queue has {len(items)}).", ephemeral=True
-            )
+            return await self.fail(interaction, f"There's no song at position {position} (queue has {len(items)}).")
         to = min(to, len(items))
         track = items.pop(position - 1)
         items.insert(to - 1, track)
         state.queue = deque(items)
         where = "next up" if to == 1 else f"position {to}"
-        await interaction.response.send_message(f"Moved **{track.title}** to {where}.")
+        await self.bot.messages.reply(interaction, f"Moved **{track.title}** to {where}.")
+        await self.refresh_panel(interaction.guild, state)
 
     @app_commands.command(name="skip", description="Skip the current song")
     @app_commands.guild_only()
     async def skip(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
             state = self.state(interaction.guild)
             state.loop = False  # otherwise loop would replay the skipped track
             vc.stop()
-            await interaction.response.send_message("Skipped.", ephemeral=True)
+            await self.bot.messages.reply(interaction, "Skipped.", ephemeral=True)
+            await self.refresh_panel(interaction.guild, state)
         else:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            await self.fail(interaction, "Nothing is playing.")
 
     @app_commands.command(name="pause", description="Pause playback")
     @app_commands.guild_only()
     async def pause(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message("Paused.", ephemeral=True)
+            await self.bot.messages.reply(interaction, "Paused.", ephemeral=True)
+            await self.refresh_panel(interaction.guild)
         else:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            await self.fail(interaction, "Nothing is playing.")
 
     @app_commands.command(name="resume", description="Resume playback")
     @app_commands.guild_only()
     async def resume(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         vc = interaction.guild.voice_client
         if vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message("Resumed.", ephemeral=True)
+            await self.bot.messages.reply(interaction, "Resumed.", ephemeral=True)
+            await self.refresh_panel(interaction.guild)
         else:
-            await interaction.response.send_message("Nothing is paused.", ephemeral=True)
-
-    @app_commands.command(name="stop", description="Stop playback and clear the queue")
-    @app_commands.guild_only()
-    async def stop(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        vc = interaction.guild.voice_client
-        state = self.state(interaction.guild)
-        # Invalidate callbacks before stop can schedule the next track.
-        tracks = list(state.queue)
-        if state.current:
-            tracks.append(state.current)
-        state.queue.clear()
-        state.current = None
-        state.loop = False
-        if state.idle_task:
-            state.idle_task.cancel()
-        if vc:
-            vc.stop()
-            if vc.source:
-                vc.source.cleanup()
-        for track in tracks:
-            if track.karaoke:
-                await track.karaoke.finish("Stopped")
-        state.idle_task = asyncio.create_task(self.leave_after_idle(interaction.guild))
-        await interaction.followup.send("Stopped and cleared the queue.")
+            await self.fail(interaction, "Nothing is paused.")
 
     @app_commands.command(name="leave", description="Disconnect from voice")
     @app_commands.guild_only()
     async def leave(self, interaction: discord.Interaction):
-        vc = interaction.guild.voice_client
-        if vc is None:
-            return await interaction.response.send_message("I'm not in a voice channel.", ephemeral=True)
-        await interaction.response.defer()
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         await self.disconnect(interaction.guild)
-        await interaction.followup.send("Bye!")
+        await self.bot.messages.reply(interaction, "Disconnected from voice.")
 
     @app_commands.command(name="queue", description="Show the queue")
     @app_commands.guild_only()
     async def queue(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction, mutation=False):
+            return
         state = self.state(interaction.guild)
         if not state.current and not state.queue:
-            return await interaction.response.send_message("The queue is empty.", ephemeral=True)
+            return await self.fail(interaction, "The queue is empty.")
         lines = []
         if state.current:
             lines.append(f"**Now:** {state.current.title} [{fmt_duration(state.current.duration)}]")
@@ -593,44 +761,43 @@ class Music(commands.Cog):
             lines.append(f"{i}. {t.title} [{fmt_duration(t.duration)}]")
         if len(state.queue) > 10:
             lines.append(f"...and {len(state.queue) - 10} more")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await self.bot.messages.reply(interaction, "\n".join(lines), ephemeral=True)
 
     @app_commands.command(name="nowplaying", description="Show the current song")
     @app_commands.guild_only()
     async def nowplaying(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction, mutation=False):
+            return
         t = self.state(interaction.guild).current
         if not t:
-            return await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-        await interaction.response.send_message(
-            f"**{t.title}** [{fmt_duration(t.duration)}]\n{t.webpage_url}", ephemeral=True
+            return await self.fail(interaction, "Nothing is playing.")
+        await self.bot.messages.reply(
+            interaction, f"**{t.title}** [{fmt_duration(t.duration)}]\n{t.webpage_url}", ephemeral=True
         )
-
-    @app_commands.command(name="volume", description="Set volume (0-100)")
-    @app_commands.describe(level="Volume from 0 to 100")
-    @app_commands.guild_only()
-    async def volume(self, interaction: discord.Interaction, level: app_commands.Range[int, 0, 100]):
-        state = self.state(interaction.guild)
-        state.volume = level / 100
-        vc = interaction.guild.voice_client
-        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-            vc.source.volume = state.volume
-        await interaction.response.send_message(f"Volume set to {level}%.", ephemeral=True)
 
     @app_commands.command(name="loop", description="Toggle looping the current song")
     @app_commands.guild_only()
     async def loop(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         state = self.state(interaction.guild)
         state.loop = not state.loop
-        await interaction.response.send_message(f"Loop is now {'on' if state.loop else 'off'}.")
+        await self.bot.messages.reply(interaction, f"Loop is now {'on' if state.loop else 'off'}.")
+        await self.refresh_panel(interaction.guild, state)
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
     @app_commands.guild_only()
     async def shuffle(self, interaction: discord.Interaction):
+        if not await self.control_guard(interaction):
+            return
+        await self.defer(interaction)
         state = self.state(interaction.guild)
         items = list(state.queue)
         random.shuffle(items)
         state.queue = deque(items)
-        await interaction.response.send_message("Queue shuffled.")
+        await self.bot.messages.reply(interaction, "Queue shuffled.")
+        await self.refresh_panel(interaction.guild, state)
 
     # ---------- housekeeping ----------
 
@@ -641,6 +808,8 @@ class Music(commands.Cog):
             state = self.states.pop(member.guild.id, None)
             if state:
                 await self.clear_tracks(state, "Disconnected")
+                state.notice = "Disconnected"
+                await self.refresh_panel(member.guild, state)
             return
         vc = member.guild.voice_client
         if vc is None or vc.channel is None:
@@ -655,6 +824,7 @@ class Music(commands.Cog):
                 await self.disconnect(guild, "Bot shutting down")
             else:
                 await self.clear_tracks(self.states.pop(guild_id), "Bot shutting down")
+        self.playback_view.stop()
 
 
 async def setup(bot: commands.Bot):

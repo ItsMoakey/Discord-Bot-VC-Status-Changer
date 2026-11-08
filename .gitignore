@@ -9,3 +9,4 @@ __pycache__/
 feature_settings.json
 join_sound_settings.json
 vc_emojis.json
+playback_panels.json

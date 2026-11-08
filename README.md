@@ -9,7 +9,7 @@ Users can set their own emoji with the `/vcadd` command, and optionally specify 
 
 ### Feature toggles
 
-Use `/features` to see this server's settings. Members with **Manage Server** can use `/toggle system:<system> enabled:False` to disable a system, `enabled:True` to enable it, or omit `enabled` to flip the current setting.
+Use `/features` to see this server's settings. Members with **Manage Server** get private on/off buttons for each system. `/toggle system:<system> enabled:False` disables a system, `enabled:True` enables it, or omitting `enabled` flips its setting. Buttons and slash commands share the same permission checks and saved settings.
 
 The choices are **Voice channel statuses**, **Instagram embeds**, **Music**, **Karaoke**, and **Join sound**. All start enabled and are saved independently per server in `feature_settings.json`; set `FEATURE_SETTINGS_FILE` to change its path.
 
@@ -21,12 +21,19 @@ The choices are **Voice channel statuses**, **Instagram embeds**, **Music**, **K
 
 ### Instagram embeds
 
-Instagram links no longer embed in Discord, so when someone posts an Instagram post, reel, or share link the bot replies with the same link on an embed proxy (default `fxinstagram.com`) and hides the original empty preview.
+Instagram links no longer embed in Discord, so when someone posts an Instagram post, reel, or share link the bot publishes the proxy link through a reusable webhook (default proxy `fxinstagram.com`) and hides the original empty preview.
 
 - Enable **Message Content Intent** for the bot in the Developer Portal (Bot → Privileged Gateway Intents), otherwise it can't see links.
-- Give the bot **Send Messages** and **Manage Messages** (the latter is only needed to hide the original preview; without it the bot still replies).
+- Give the bot **Send Messages**, **Embed Links**, **Manage Webhooks**, and **Manage Messages** (the latter is only needed to hide the original preview).
 - Set `EMBED_DOMAIN` to use a different or self-hosted proxy, e.g. `EMBED_DOMAIN=ig.example.com`.
 - Wrap a link in `<...>` to stop the bot from embedding it.
+
+### Public messages and buttons
+
+Public playback updates, karaoke preparation/lyrics, and Instagram previews use a reusable bot-owned webhook per channel. Messages display the bot's actual server name and avatar; the underlying integration is named **VC Bot** for discovery. Give the bot **Manage Webhooks** in each channel where these features are used (on the parent channel for threads). Webhook credentials are not written to settings files. Missing access produces an actionable private error instead of silently reverting to normal bot messages.
+
+Reusable webhooks do not have interaction tokens' 15-minute expiry. Private errors, queue queries, and administrative confirmations remain private interaction responses.
+
 
 ### Music
 
@@ -36,20 +43,21 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 |---|---|
 | `/play <url or search>` | Play or queue a song. A playlist link (YouTube `/playlist?list=...`, SoundCloud sets) queues the first 50 songs; a video link with `&list=` on it plays just that video |
 | `/karaoke <youtube-link>` | Prepare a vocal-removed instrumental and queue it with synced or paginated lyrics |
+| `/controls` | Post a playback panel with Play, Karaoke, Queue, Pause/Resume, Skip, Loop, Shuffle, Leave, and Bring controls here |
 | `/move <position> [to]` | Move a song already in the queue to position 1 (next up), or to `to` |
 | `/pause` / `/resume` | Pause or resume |
 | `/skip` | Skip the current song |
-| `/stop` | Stop and clear the queue |
-| `/leave` | Disconnect |
+| `/leave` | End playback, clear the queue, and disconnect |
 | `/queue` | Show the queue |
 | `/nowplaying` | Show the current song |
-| `/volume <0-100>` | Set volume |
 | `/loop` | Toggle looping the current song |
 | `/shuffle` | Shuffle the queue |
 | `/joinsound [enabled]` | Toggle the arrival clip for this server, or explicitly set on/off (Manage Channels required) |
 
 - Give the bot **Connect** and **Speak**.
-- To keep the channel tidy, "Loading..." and "Now playing" are one message that gets edited, and the next "Now playing" edits it again as long as it's still the newest message in the channel. Plain confirmations and errors (`/skip`, `/pause`, `/resume`, `/volume`, `/queue`, `/nowplaying`, "Nothing is playing", etc.) are only visible to the person who ran the command. Queue changes (`/play` adding a song, `/move`, `/shuffle`, `/loop`) and `/stop`/`/leave` stay public.
+- Playback status is one rich webhook panel reused when songs start or change; temporary loading messages are removed once the panel updates. The nine buttons use short 3/3/2/1 rows, with Bring controls here on its own row. Buttons survive a bot restart and resolve current server state rather than a stale track. Playback-changing controls require being in the bot's voice channel; Queue is readable server-wide. Play/Karaoke open an input form and recheck feature/voice permissions when submitted.
+- The canonical panel's channel/message IDs are saved in `playback_panels.json` (override with `PLAYBACK_PANEL_FILE`) so starting playback after a restart reuses it rather than creating duplicates. This contains no webhook credentials; queues themselves still reset on restart.
+- **Bring controls here** (on playback and active lyrics messages) posts fresh controls at the bottom of chat, then deletes the previous controls. It also removes an old panel used after a restart; lyric messages themselves are not deleted. If posting fails, the old controls remain available. `/controls` does the same without needing to scroll to a button.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
 - The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
 
@@ -61,20 +69,22 @@ When `/play` first connects the bot to voice, it plays your local audio clip bef
 2. Join sounds are enabled by default. Use `/joinsound` to toggle them for the current server, or `/joinsound enabled:False` / `/joinsound enabled:True` to explicitly turn them off/on. Requires **Manage Channels**. Changes apply to future joins, not a clip already playing.
 3. The toggle is saved with the other features in `feature_settings.json` and survives bot restarts and voice disconnects. Set `FEATURE_SETTINGS_FILE` to change the storage path. Relative audio/settings paths are resolved from the folder you run the bot from.
 
-The clip uses the music player's current volume and requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission or Discord sound ID. A missing clip or playback-start failure is logged and music continues without the announcement. Keep the clip short: the first song waits for it to finish.
+The clip requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission or Discord sound ID. A missing clip or playback-start failure is logged and music continues without the announcement. Keep the clip short: the first song waits for it to finish.
 
 ### Karaoke
 
-`/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals using Demucs's `htdemucs` model on CPU. The resulting `no_vocals.wav` uses the existing music queue, volume, pause/resume, skip, stop, and loop controls. Only use audio you have permission to download and process.
+`/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals using Demucs's `htdemucs` model. The resulting `no_vocals.wav` uses the existing music queue, pause/resume, skip, leave, and loop controls. Only use audio you have permission to download and process.
 
-Stock Demucs/PyTorch does not use Vulkan for inference. AMD GPU acceleration requires a supported ROCm GPU/OS stack, not just a Vulkan driver. The homelab's Radeon 820M (GFX1153) on Debian 13 currently runs separation on CPU; no unsupported GPU override is enabled.
+`KARAOKE_DEVICE=auto` selects `cuda` when the installed PyTorch build reports an available CUDA/ROCm device, otherwise `cpu`. Set `cpu` to force CPU, or `cuda` to require a compatible GPU; an unavailable explicitly requested GPU fails with an explanation rather than silently using CPU. The selected backend, PyTorch build, and HIP version are recorded in the preparation worker log. Stock Demucs/PyTorch cannot use the Vulkan driver as its inference backend.
+
+The homelab currently has PyTorch `2.5.1+cpu`, no ROCm installation, and a Radeon 820M reported by Vulkan as GFX1153. It therefore uses CPU even though Vulkan works. AMD's [ROCm APU support matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html) lists supported Ubuntu/Windows configurations, not this Debian 13 APU setup. Enabling acceleration requires a compatible supported compute stack; changing the device setting alone cannot provide it. No architecture override or host driver replacement is enabled.
 
 - LRCLIB is searched for matching lyrics. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
 - If no matching lyrics are found or the lyrics service is unavailable, the instrumental still plays with an explanatory message. Vocal-separation failure never falls back to the original vocal audio.
-- Discord cannot force clients to scroll. Lyrics advance inside one message instead. Interaction webhooks expire after 15 minutes, so queued/long-running lyric and preparation messages transfer to a normal bot message shortly before expiry. Give the bot **Send Messages** and **Embed Links**; no **Manage Webhooks** permission is needed.
+- Discord cannot force clients to scroll. Lyrics advance inside one durable webhook message instead, without a 15-minute handoff. Finished sessions disable their lyric controls.
 - Separation can take several minutes, especially on CPU. The first run downloads model weights and needs internet access, free disk space, and sufficient RAM. Vocal bleed/artifacts are possible. One preparation runs at a time across the bot, with at most one pending request per server.
-- Prepared audio is temporary and removed when the track finishes, is skipped/stopped, karaoke is disabled, or the bot disconnects. Model weights remain cached for reuse.
+- Prepared audio is temporary and removed when the track finishes, is skipped, karaoke is disabled, or the bot disconnects. Model weights remain cached for reuse.
 
 #### Karaoke dependencies
 
@@ -95,7 +105,7 @@ On other platforms, create the environment with `python3.11 -m venv .venv-karaok
 The Discord voice dependencies are pinned as a tested pair (`discord.py 2.7.1` and `davey 0.1.0`). With `davey 0.2.0`, live testing found that DAVE negotiation never became ready and playback was silent despite valid PCM and outgoing UDP packets. Keep the pair pinned when reinstalling.
 
 1. In the Developer Portal, enable the **Server Members Intent** and **Message Content Intent**.
-2. Invite the bot with the `bot` and `applications.commands` scopes and the permissions above (View Channels, Send Messages, Embed Links, Manage Messages, Manage Channels, Connect, Speak).
+2. Invite the bot with the `bot` and `applications.commands` scopes and the permissions above (View Channels, Send Messages, Embed Links, Manage Webhooks, Manage Messages, Manage Channels, Connect, Speak).
 3. Install and run:
 
 ```bash
@@ -116,5 +126,7 @@ cogs/vc_status.py       VC emoji statuses
 cogs/features.py        saved server feature switches and slash-command gates
 cogs/instagram_embed.py Instagram link embeds
 cogs/music.py           music player
+cogs/music_controls.py  persistent playback buttons and song input forms
+cogs/messages.py        reusable public webhook delivery
 cogs/karaoke.py         instrumental preparation and live/paginated lyrics
 ```

@@ -6,6 +6,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from cogs.features import FeatureStore, FeatureTree
+from cogs.messages import PublicMessages
 
 ## A Discord bot that updates voice channel statuses to show custom emojis for who's currently in them,
 ## re-posts Instagram links through an embed proxy, and plays music in voice channels.
@@ -33,6 +34,7 @@ class Bot(commands.Bot):
         intents.message_content = True  # privileged: enable "Message Content Intent" (Instagram links)
         super().__init__(command_prefix="!", intents=intents, tree_cls=FeatureTree)
         self.features = FeatureStore()
+        self.messages = PublicMessages(self)
 
     async def setup_hook(self):
         for ext in EXTENSIONS:
