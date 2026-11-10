@@ -17,19 +17,17 @@ import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.music import Track
+from cogs.music import Track, is_playlist_url
 from cogs.messages import PublicMessageError
 
 log = logging.getLogger("musicbot.karaoke")
 LRCLIB_URL = "https://lrclib.net/api/search"
-VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 STAMP = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 DECORATION = re.compile(
     r"\s*[\[(][^\])]*(?:official|lyrics?|audio|video|visuali[sz]er|hd|4k)[^\])]*[\])]",
@@ -39,42 +37,6 @@ DECORATION = re.compile(
 
 class PreparationError(Exception):
     """An error with a safe, actionable explanation for the command's user."""
-
-
-def youtube_video_url(value: str) -> str:
-    """Canonicalize only actual YouTube video links, never arbitrary download URLs."""
-    try:
-        parsed = urlsplit(value.strip())
-        if (
-            parsed.scheme.lower() not in {"https", "http"}
-            or parsed.hostname not in {
-                "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"
-            }
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.port is not None
-        ):
-            raise ValueError
-        parts = parsed.path.strip("/").split("/")
-        if parsed.hostname == "youtu.be" and len(parts) == 1:
-            video_id = parts[0]
-        elif parsed.hostname != "youtu.be" and parsed.path.rstrip("/") == "/watch":
-            values = parse_qs(parsed.query).get("v", [])
-            if len(values) != 1:
-                raise ValueError
-            video_id = values[0]
-        elif parsed.hostname != "youtu.be" and len(parts) == 2 and parts[0] in {"shorts", "live", "embed"}:
-            video_id = parts[1]
-        else:
-            raise ValueError
-        if not VIDEO_ID.fullmatch(video_id):
-            raise ValueError
-    except (ValueError, TypeError):
-        raise PreparationError(
-            "Use a normal YouTube video link (youtube.com/watch?v=… or youtu.be/…). "
-            "Playlist-only links and other sites are not supported."
-        ) from None
-    return f"https://www.youtube.com/watch?v={video_id}"
 
 
 def safe_text(value: str) -> str:
@@ -248,24 +210,39 @@ async def lookup_lyrics(info: dict) -> Lyrics:
 # Use the same download defaults as music, but in a killable interpreter rather
 # than a thread: cancellation must not leave a download writing into a deleted directory.
 DOWNLOAD_WORKER = r'''
-import json, sys
+import json, math, sys
 from pathlib import Path
 import yt_dlp
 from cogs.music import YDL_OPTS
 root = Path(sys.argv[2])
-def finite_video(info, *, incomplete=False):
-    if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming"}:
-        return "Live streams and upcoming videos cannot be prepared as karaoke."
-options = {**YDL_OPTS, "default_search": "error", "noplaylist": True,
-           "allowed_extractors": ["youtube"], "outtmpl": str(root / "source.%(ext)s"),
-           "overwrites": True, "match_filter": finite_video}
+def finite_song(info, *, incomplete=False):
+    if info.get("is_live") or info.get("is_upcoming") or info.get("live_status") in {"is_live", "is_upcoming"}:
+        return "Live streams and upcoming media cannot be prepared as karaoke."
+    duration = info.get("duration")
+    if isinstance(duration, (int, float)) and (not math.isfinite(duration) or duration <= 0):
+        return "A finite song is required for karaoke."
+options = {**YDL_OPTS, "noplaylist": True, "playlistend": 1,
+           "outtmpl": str(root / "source.%(ext)s"),
+           "overwrites": True, "match_filter": finite_song}
 with yt_dlp.YoutubeDL(options) as ydl:
-    info = ydl.extract_info(sys.argv[1], download=True)
-    if not info or info.get("_type") == "playlist" or info.get("is_live"):
-        raise RuntimeError("A finite YouTube video is required; live streams/playlists are unsupported.")
-    downloads = info.get("requested_downloads") or []
-    audio = downloads[0].get("filepath") if downloads else None
-    audio = audio or ydl.prepare_filename(info)
+    info = ydl.extract_info(sys.argv[1], download=False)
+    if isinstance(info, dict) and "entries" in info:
+        if info.get("extractor_key") != "YoutubeSearch":
+            raise RuntimeError("Playlist links are unsupported; choose one song or enter search words.")
+        entries = [entry for entry in info["entries"] or [] if entry]
+        if len(entries) != 1:
+            raise RuntimeError("No single song was found for this search.")
+        info = entries[0]
+    if not isinstance(info, dict) or info.get("_type", "video") != "video" or "entries" in info:
+        raise RuntimeError("A single finite song is required; playlists are unsupported.")
+    reason = finite_song(info)
+    if reason:
+        raise RuntimeError(reason)
+    if not info.get("webpage_url"):
+        raise RuntimeError("The selected song has no usable source link.")
+    # Download the resolved format, without extracting the chosen search result again.
+    ydl.process_info(info)
+    audio = info.get("filepath") or ydl.prepare_filename(info)
     data = {key: info.get(key) for key in ("title", "track", "artist", "duration", "webpage_url")}
     data["download_path"] = audio
     (root / "metadata.json").write_text(json.dumps(data), encoding="utf-8")
@@ -346,29 +323,46 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
         if stage == "ffmpeg":
             raise PreparationError("FFmpeg could not decode this audio. Check the bot's FFmpeg installation and console error.")
         raise PreparationError(
-            "YouTube audio could not be downloaded. The video may be private, restricted, live, or unavailable; "
-            "check the console and update yt-dlp if YouTube extraction is failing."
+            "Audio could not be downloaded. Use search words or one supported song link, not a playlist "
+            "or live/upcoming stream. The media may be private, restricted, or unavailable; "
+            "check the console and update yt-dlp if extraction is failing."
         )
 
 
-async def prepare_audio(url: str, root: Path) -> tuple[dict, str]:
-    await run_process([sys.executable, "-c", DOWNLOAD_WORKER, url, str(root)], root, "download")
+async def prepare_audio(query: str, root: Path) -> tuple[dict, str, Lyrics]:
+    if is_playlist_url(query):
+        raise PreparationError("Karaoke prepares one song at a time. Use a song link or search words, not a playlist link.")
+    await run_process([sys.executable, "-c", DOWNLOAD_WORKER, query, str(root)], root, "download")
     info = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
     source = Path(info["download_path"]).resolve()
     if not source.is_relative_to(root.resolve()) or not source.is_file():
-        raise PreparationError("The YouTube download did not produce a usable local audio file.")
-    wav = root / "input.wav"
-    await run_process([
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(source), "-vn", "-ar", "44100", "-ac", "2", str(wav),
-    ], root, "ffmpeg")
-    await run_process([
-        sys.executable, str(Path(__file__).with_name("karaoke_worker.py")), str(root / "stems"), str(wav),
-    ], root, "separation")
-    instrumental = root / "stems" / "no_vocals.wav"
-    if not instrumental.is_file() or instrumental.stat().st_size <= 44:
-        raise PreparationError("Separation finished without a usable no_vocals.wav. Check its console output; no original audio was queued.")
-    return info, str(instrumental)
+        raise PreparationError("The download did not produce a usable local audio file.")
+    lyrics_task = asyncio.create_task(lookup_lyrics(info))
+    try:
+        wav = root / "input.wav"
+        await run_process([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(source), "-vn", "-ar", "44100", "-ac", "2", str(wav),
+        ], root, "ffmpeg")
+        await run_process([
+            sys.executable, str(Path(__file__).with_name("karaoke_worker.py")), str(root / "stems"), str(wav),
+        ], root, "separation")
+        instrumental = root / "stems" / "no_vocals.wav"
+        if not instrumental.is_file() or instrumental.stat().st_size <= 44:
+            raise PreparationError("Separation finished without a usable no_vocals.wav. Check its console output; no original audio was queued.")
+        lyrics = await lyrics_task
+        return info, str(instrumental), lyrics
+    except BaseException:
+        # Reap the lookup too, including repeated cancellation, before the caller removes root.
+        lyrics_task.cancel()
+        cleanup = asyncio.gather(lyrics_task, return_exceptions=True)
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
 
 
 class ClockedPCM(discord.AudioSource):
@@ -608,14 +602,19 @@ class Karaoke(commands.Cog):
         self.preparations: dict[int, asyncio.Task] = {}
         self.heavy_jobs = asyncio.Semaphore(1)
 
-    @app_commands.command(name="karaoke", description="Prepare a YouTube instrumental with real vocal removal and lyrics")
-    @app_commands.describe(url="A normal YouTube video link, not a playlist")
+    @app_commands.command(name="karaoke", description="Prepare a song instrumental with real vocal removal and lyrics")
+    @app_commands.describe(query="Song link or search words (one song, not a playlist)")
     @app_commands.guild_only()
-    async def karaoke(self, interaction: discord.Interaction, url: str) -> None:
+    async def karaoke(self, interaction: discord.Interaction, query: str) -> None:
         guild = interaction.guild
         music = self.bot.get_cog("Music")
         if music is None:
             return await interaction.response.send_message("The music service is unavailable. Ask the bot owner to load it.", ephemeral=True)
+        async with music.preparing_track(guild):
+            await self._karaoke(interaction, query, music)
+
+    async def _karaoke(self, interaction: discord.Interaction, query: str, music) -> None:
+        guild = interaction.guild
         if not self.bot.features.enabled(guild.id, "karaoke"):
             return await interaction.response.send_message("Karaoke is disabled in this server.", ephemeral=True)
         voice = getattr(interaction.user, "voice", None)
@@ -626,10 +625,11 @@ class Karaoke(commands.Cog):
             return await self.bot.messages.reply(
                 interaction, "Join my voice channel to prepare karaoke.", ephemeral=True,
             )
-        try:
-            url = youtube_video_url(url)
-        except PreparationError as error:
-            return await interaction.response.send_message(str(error), ephemeral=True)
+        query = query.strip()
+        if is_playlist_url(query):
+            return await interaction.response.send_message(
+                "Karaoke prepares one song at a time. Use a song link or search words, not a playlist link.", ephemeral=True,
+            )
         if guild.id in self.preparations:
             return await interaction.response.send_message("A karaoke track is already being prepared for this server. Please wait.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -652,19 +652,16 @@ class Karaoke(commands.Cog):
                 if not self.bot.features.enabled(guild.id, "karaoke"):
                     raise PreparationError("Karaoke was disabled before preparation could start.")
                 temporary = tempfile.TemporaryDirectory(prefix="discord-karaoke-")
-                await progress.update("Downloading YouTube audio and preparing the instrumental; the selected separation engine and device are recorded in the worker log…")
-                info, audio_path = await prepare_audio(url, Path(temporary.name))
+                await progress.update("Finding and downloading the song, then preparing the instrumental and looking up lyrics in parallel; the selected separation engine and device are recorded in the worker log…")
+                info, audio_path, lyrics = await prepare_audio(query, Path(temporary.name))
             if not self.bot.features.enabled(guild.id, "karaoke"):
                 raise PreparationError("Karaoke was disabled while this track was being prepared.")
-            lyrics = await lookup_lyrics(info)
-            if not self.bot.features.enabled(guild.id, "karaoke"):
-                raise PreparationError("Karaoke was disabled while this track was being prepared.")
-            title = str(info.get("title") or "YouTube karaoke")
+            title = str(info.get("title") or "Karaoke")
             session = KaraokeSession(audio_path, temporary, interaction, title, lyrics)
             temporary = None  # From this point only the session owns the directory.
             await session.publish()
             track = Track(
-                title=title, webpage_url=url, duration=info.get("duration"),
+                title=title, webpage_url=str(info["webpage_url"]), duration=info.get("duration"),
                 requester=interaction.user.mention, karaoke=session,
             )
             accepted = bool(await music.enqueue_prepared(interaction, track))

@@ -6,6 +6,7 @@ import os
 import random
 import tempfile
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -108,6 +109,7 @@ class GuildState:
         self.loop = False
         self.text_channel: discord.abc.Messageable | None = None
         self.idle_task: asyncio.Task | None = None
+        self.pending_requests = 0
         self.panel: discord.WebhookMessage | None = None
         self.notice = ""
 
@@ -259,6 +261,31 @@ class Music(commands.Cog):
     def state(self, guild: discord.Guild) -> GuildState:
         return self.states.setdefault(guild.id, GuildState())
 
+    @asynccontextmanager
+    async def preparing_track(self, guild: discord.Guild):
+        """Pending lookup/separation is work, not an idle voice connection."""
+        state = self.state(guild)
+        state.pending_requests += 1
+        if state.idle_task:
+            state.idle_task.cancel()
+            state.idle_task = None
+        try:
+            yield
+        finally:
+            state.pending_requests -= 1
+            vc = guild.voice_client
+            if (
+                self.states.get(guild.id) is state
+                and not state.pending_requests
+                and vc is not None
+                and not vc.is_playing()
+                and not vc.is_paused()
+                and not state.queue
+            ):
+                if state.idle_task:
+                    state.idle_task.cancel()
+                state.idle_task = asyncio.create_task(self.leave_after_idle(guild))
+
     # ---------- playback core ----------
 
     async def leave_after_idle(self, guild: discord.Guild):
@@ -266,7 +293,7 @@ class Music(commands.Cog):
         await asyncio.sleep(IDLE_LEAVE_SECONDS)
         vc = guild.voice_client
         state = self.states.get(guild.id)
-        if vc is None or vc.is_playing() or vc.is_paused() or (state and state.queue):
+        if vc is None or vc.is_playing() or vc.is_paused() or (state and (state.queue or state.pending_requests)):
             return
         if state:
             state.idle_task = None
@@ -592,6 +619,10 @@ class Music(commands.Cog):
         await self.defer(interaction)
         if not await self.control_guard(interaction, feature="music", allow_disconnected=True):
             return
+        async with self.preparing_track(interaction.guild):
+            await self._enqueue_query(interaction, query)
+
+    async def _enqueue_query(self, interaction: discord.Interaction, query: str):
         if is_playlist_url(query):
             await self.join_voice(interaction.guild, interaction.user.voice.channel)
             return await self.enqueue_playlist(interaction, query)

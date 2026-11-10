@@ -42,7 +42,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 | Command | What it does |
 |---|---|
 | `/play <url or search>` | Play or queue a song. A playlist link (YouTube `/playlist?list=...`, SoundCloud sets) queues the first 50 songs; a video link with `&list=` on it plays just that video |
-| `/karaoke <youtube-link>` | Prepare a vocal-removed instrumental and queue it with synced or paginated lyrics |
+| `/karaoke <url or search>` | Search for one song or use a supported single-media link, then prepare a vocal-removed instrumental and queue it with synced or paginated lyrics |
 | `/controls` | Post a playback panel with Play, Karaoke, Queue, Pause/Resume, Skip, Loop, Shuffle, Leave, and Bring controls here |
 | `/move <position> [to]` | Move a song already in the queue to position 1 (next up), or to `to` |
 | `/pause` / `/resume` | Pause or resume |
@@ -60,7 +60,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 - **Bring controls here** (on playback and active lyrics messages) posts fresh controls at the bottom of chat, then deletes the previous controls. It also removes an old panel used after a restart; lyric messages themselves are not deleted. If posting fails, the old controls remain available. `/controls` does the same without needing to scroll to a button.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
 - Normal `/play` streams audio directly; it does not run vocal separation or wait for the full track to download. Media lookup runs alongside voice connection/arrival playback, and immediate playback reuses that lookup's stream URL. Queued and looped songs resolve a fresh URL when they actually start. Network extraction, Discord voice negotiation, and the optional arrival clip can still add startup time.
-- The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
+- The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Pending song/playlist lookups and karaoke preparation do not count as idle time. Once the last pending request fails or is cancelled, a fresh idle countdown starts if nothing is playing or queued. Queues are in memory and reset on restart.
 
 #### Join sound
 
@@ -74,7 +74,7 @@ The clip requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission 
 
 ### Karaoke
 
-`/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals with the engine selected by `KARAOKE_BACKEND`: **`mdx`** (recommended default, dedicated two-stem `UVR-MDX-NET-Inst_Main.onnx`) or **`demucs`** (`htdemucs`, supported quality alternative). The resulting `no_vocals.wav` uses the existing music queue, pause/resume, skip, leave, and loop controls. Only use audio you have permission to download and process.
+`/karaoke <url or search>` uses the same yt-dlp search and supported-site input handling as `/play`, but prepares just one finite song. Searches select one result; single-media links from YouTube, SoundCloud, and other yt-dlp-supported sites are accepted. Live streams, upcoming media, and pure playlist links are rejected; a video link with a playlist parameter still selects just that video. It downloads the audio, decodes it with FFmpeg, and separates vocals with the engine selected by `KARAOKE_BACKEND`: **`mdx`** (recommended default, dedicated two-stem `UVR-MDX-NET-Inst_Main.onnx`) or **`demucs`** (`htdemucs`, supported quality alternative). The resulting `no_vocals.wav` uses the existing music queue, pause/resume, skip, leave, and loop controls. Only use audio you have permission to download and process.
 
 MDX is recommended when preparation speed matters. Demucs is not obsolete: it can separate some songs more cleanly, so both setups remain supported. Neither engine guarantees artifact-free audio.
 
@@ -90,7 +90,7 @@ Demucs preparation speed can be tuned without editing code (these settings do no
 
 Set these in `.env` (or the service/container environment) and restart the bot. Existing service environment variables take precedence over `.env`. Both engines still process the whole track before playback starts. Demucs's `--two-stems` combines its four estimated sources; MDX uses a model trained for two stems. The engines can produce different vocal bleed and musical artifacts, so compare representative songs before choosing one.
 
-- LRCLIB is searched for matching lyrics. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
+- LRCLIB lookup starts after download metadata is available and runs alongside FFmpeg decoding and vocal separation to reduce startup waiting. Unlike `/play` streaming, karaoke still downloads and processes the whole track before playback; it never streams partially separated audio. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
 - If no matching lyrics are found or the lyrics service is unavailable, the instrumental still plays with an explanatory message. Vocal-separation failure never falls back to the original vocal audio.
 - Discord cannot force clients to scroll. Lyrics advance inside one durable webhook message instead, without a 15-minute handoff. Finished sessions disable their lyric controls.

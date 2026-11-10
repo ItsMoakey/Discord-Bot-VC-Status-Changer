@@ -16,9 +16,6 @@ class PlaybackInput(discord.ui.Modal):
     def __init__(self, *, karaoke: bool):
         super().__init__(title="Start karaoke" if karaoke else "Play a song")
         self.karaoke = karaoke
-        if karaoke:
-            self.query.label = "YouTube video URL"
-            self.query.placeholder = "Paste a normal YouTube video link (not a playlist)"
 
     async def on_submit(self, interaction: discord.Interaction):
         music = interaction.client.get_cog("Music")
