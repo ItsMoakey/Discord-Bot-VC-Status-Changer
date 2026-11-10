@@ -77,7 +77,7 @@ The clip requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission 
 
 `KARAOKE_DEVICE=auto` selects `cuda` when the installed PyTorch build reports an available CUDA/ROCm device, otherwise `cpu`. Set `cpu` to force CPU, or `cuda` to require a compatible GPU; an unavailable explicitly requested GPU fails with an explanation rather than silently using CPU. The selected backend, PyTorch build, and HIP version are recorded in the preparation worker log. Stock Demucs/PyTorch cannot use the Vulkan driver as its inference backend.
 
-The homelab currently has PyTorch `2.5.1+cpu`, no ROCm installation, and a Radeon 820M reported by Vulkan as GFX1153. It therefore uses CPU even though Vulkan works. AMD's [ROCm APU support matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html) lists supported Ubuntu/Windows configurations, not this Debian 13 APU setup. Enabling acceleration requires a compatible supported compute stack; changing the device setting alone cannot provide it. No architecture override or host driver replacement is enabled.
+A CPU-only PyTorch build cannot use a GPU, even when Vulkan or another application's GPU runtime works. Use the GPU setup below to install a compatible CUDA or ROCm build for your hardware.
 
 - LRCLIB is searched for matching lyrics. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
@@ -98,6 +98,43 @@ python vc_status_bot.py
 ```
 
 On other platforms, create the environment with `python3.11 -m venv .venv-karaoke` and activate it with `source .venv-karaoke/bin/activate`. Install both requirements files in the same environment used to run the bot. The optional dependency file is not needed for normal music, VC statuses, or Instagram embeds.
+
+#### GPU acceleration (CUDA or ROCm)
+
+Create a separate **64-bit Python 3.11** environment for GPU karaoke rather than upgrading a working environment in place:
+
+```bash
+python3.11 -m venv .venv-gpu
+source .venv-gpu/bin/activate
+python -m pip install --upgrade pip
+```
+
+On Windows, create it with `py -3.11 -m venv .venv-gpu` and activate it with `.\.venv-gpu\Scripts\Activate.ps1`.
+
+1. Install the GPU driver and a matching **PyTorch 2.11.0 / torchaudio 2.11.0** pair using the instructions for your platform:
+   - **NVIDIA:** select the CUDA build compatible with your driver from the [PyTorch installation instructions](https://pytorch.org/get-started/previous-versions/).
+   - **AMD:** check your GPU and operating system against the [ROCm support matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html), then follow the [ROCm PyTorch installation instructions](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html). If the package distribution uses GPU-target extras, select the target reported by your hardware; do not copy another GPU's architecture or use an architecture override.
+2. Install the matching CPU TorchCodec wheel for audio file I/O, then the bot's GPU dependencies:
+
+   ```bash
+   python -m pip install --index-url https://download.pytorch.org/whl/cpu torchcodec==0.11.0
+   python -m pip install -r requirements.txt -r requirements-karaoke-gpu.txt
+   python -m pip check
+   ```
+
+   Use `requirements-karaoke-gpu.txt` **instead of** `requirements-karaoke.txt`; their PyTorch versions must not be mixed. Install the vendor's PyTorch build first: the generic requirements file does not choose a GPU backend or install a GPU driver. Vendor suffixes such as `+rocm...` satisfy the base version pins. TorchCodec's CPU wheel handles file I/O only; it does not move model inference to the CPU.
+3. Install FFmpeg with shared libraries. Both `ffmpeg` and `ffprobe` must be on PATH, and TorchCodec must be able to load the FFmpeg shared libraries. If using a custom FFmpeg distribution, configure its binary and library search paths for your platform. Minimal Linux installations may also need their distribution's OpenMP runtime package, such as `libgomp1` on Debian/Ubuntu.
+4. Verify GPU discovery in the same environment that will run the bot:
+
+   ```bash
+   python -c "import torch; assert torch.cuda.is_available(), 'No compatible GPU available'; print(torch.__version__, torch.version.hip, torch.cuda.get_device_properties(0))"
+   ```
+
+5. Set `KARAOKE_DEVICE=cuda` in `.env` to require GPU inference, then start the bot with `python vc_status_bot.py`. PyTorch uses the `cuda` API name for both NVIDIA CUDA and AMD ROCm/HIP devices.
+
+For a background service or container, use this environment's Python interpreter and provide the same device setting, FFmpeg paths, library paths, and GPU access permissions. Shell activation alone does not configure a service. Keep the previous environment and service configuration available for rollback.
+
+GPU availability does not guarantee every model operation is supported. Test a short `/karaoke` request to verify separation, WAV export, and voice playback before processing longer tracks. No Vulkan inference backend is provided.
 
 
 ### Setup

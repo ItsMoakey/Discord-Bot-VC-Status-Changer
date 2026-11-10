@@ -1,8 +1,7 @@
 # Python bytecode and local virtual environments
 __pycache__/
 *.py[cod]
-.venv/
-.venv-karaoke/
+.venv*/
 
 # Local credentials and server preferences
 .env

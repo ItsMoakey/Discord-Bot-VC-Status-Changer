@@ -1,6 +1,6 @@
-# Install alongside requirements.txt in a Python 3.11 virtual environment.
-# PyTorch 2.5.1 does not provide Python 3.14 wheels. Keep these versions paired;
-# newer torchaudio releases change the audio-loading backend Demucs expects.
+# Portable CPU/default setup; install alongside requirements.txt with Python 3.11.
+# For CUDA/ROCm GPU support, follow the README and use requirements-karaoke-gpu.txt
+# instead of this file. Do not mix the two PyTorch/torchaudio version sets.
 torch==2.5.1
 torchaudio==2.5.1
 demucs==4.0.1

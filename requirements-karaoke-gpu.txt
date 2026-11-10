@@ -1,0 +1,9 @@
+# GPU setup: install a matching CUDA or ROCm PyTorch/torchaudio pair FIRST.
+# Use alongside requirements.txt, INSTEAD OF requirements-karaoke.txt.
+# Base version pins also accept vendor local versions (e.g. +rocm...).
+# Install the CPU TorchCodec wheel as documented; it handles audio I/O only.
+torch==2.11.0
+torchaudio==2.11.0
+torchcodec==0.11.0
+demucs==4.0.1
+soundfile>=0.12

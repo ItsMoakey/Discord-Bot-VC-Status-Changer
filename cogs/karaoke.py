@@ -337,8 +337,8 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
         log.error("Karaoke %s failed (exit %s): %s", stage, code, details)
         if stage == "demucs":
             raise PreparationError(
-                "Instrumental separation failed. Run the bot in Python 3.11 with requirements.txt and "
-                "requirements-karaoke.txt installed, and ensure FFmpeg is on PATH. "
+                "Instrumental separation failed. Use the documented CPU or GPU karaoke environment "
+                "with matching PyTorch, torchaudio, and audio dependencies, and ensure FFmpeg is on PATH. "
                 "The first htdemucs run downloads model weights and needs internet access "
                 "and free disk/RAM. Check KARAOKE_DEVICE and the console for the actual Demucs/backend error; "
                 "cuda requires compatible CUDA/ROCm PyTorch and drivers (Vulkan is unsupported). The original vocals were not played."
