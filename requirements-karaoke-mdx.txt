@@ -1,0 +1,7 @@
+# Dedicated two-stem MDX setup, separate from the Demucs environment.
+# Install a matching vendor torch / torchaudio / torchvision stack FIRST for GPU use.
+# The cpu extra supplies ONNX conversion dependencies; model inference uses PyTorch.
+torch==2.12.0
+torchaudio>=2.11,<2.13
+torchvision==0.27.0
+audio-separator[cpu]==0.48.0

@@ -59,6 +59,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 - The canonical panel's channel/message IDs are saved in `playback_panels.json` (override with `PLAYBACK_PANEL_FILE`) so starting playback after a restart reuses it rather than creating duplicates. This contains no webhook credentials; queues themselves still reset on restart.
 - **Bring controls here** (on playback and active lyrics messages) posts fresh controls at the bottom of chat, then deletes the previous controls. It also removes an old panel used after a restart; lyric messages themselves are not deleted. If posting fails, the old controls remain available. `/controls` does the same without needing to scroll to a button.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
+- Normal `/play` streams audio directly; it does not run vocal separation or wait for the full track to download. Media lookup runs alongside voice connection/arrival playback, and immediate playback reuses that lookup's stream URL. Queued and looped songs resolve a fresh URL when they actually start. Network extraction, Discord voice negotiation, and the optional arrival clip can still add startup time.
 - The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Queues are in memory and reset on restart.
 
 #### Join sound
@@ -73,11 +74,21 @@ The clip requires FFmpeg, **Connect**, and **Speak**—no Soundboard permission 
 
 ### Karaoke
 
-`/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals using Demucs's `htdemucs` model. The resulting `no_vocals.wav` uses the existing music queue, pause/resume, skip, leave, and loop controls. Only use audio you have permission to download and process.
+`/karaoke <youtube-link>` downloads a single YouTube video's audio, decodes it with FFmpeg, and separates vocals with the engine selected by `KARAOKE_BACKEND`: **`mdx`** (recommended default, dedicated two-stem `UVR-MDX-NET-Inst_Main.onnx`) or **`demucs`** (`htdemucs`, supported quality alternative). The resulting `no_vocals.wav` uses the existing music queue, pause/resume, skip, leave, and loop controls. Only use audio you have permission to download and process.
 
-`KARAOKE_DEVICE=auto` selects `cuda` when the installed PyTorch build reports an available CUDA/ROCm device, otherwise `cpu`. Set `cpu` to force CPU, or `cuda` to require a compatible GPU; an unavailable explicitly requested GPU fails with an explanation rather than silently using CPU. The selected backend, PyTorch build, and HIP version are recorded in the preparation worker log. Stock Demucs/PyTorch cannot use the Vulkan driver as its inference backend.
+MDX is recommended when preparation speed matters. Demucs is not obsolete: it can separate some songs more cleanly, so both setups remain supported. Neither engine guarantees artifact-free audio.
+
+`KARAOKE_DEVICE=auto` selects `cuda` when the installed PyTorch build reports an available CUDA/ROCm device, otherwise `cpu`. Set `cpu` to force CPU, or `cuda` to require a compatible GPU; an unavailable explicitly requested GPU fails with an explanation rather than silently using CPU. The selected engine, device, PyTorch build, and HIP version are recorded in the preparation worker log. Neither engine uses Vulkan.
 
 A CPU-only PyTorch build cannot use a GPU, even when Vulkan or another application's GPU runtime works. Use the GPU setup below to install a compatible CUDA or ROCm build for your hardware.
+
+Demucs preparation speed can be tuned without editing code (these settings do not affect MDX):
+
+- `KARAOKE_SHIFTS=1` and `KARAOKE_OVERLAP=0.25` preserve Demucs's standard settings.
+- For faster preparation, try `KARAOKE_SHIFTS=0` and `KARAOKE_OVERLAP=0.1`. This skips random-shift augmentation and reduces repeated work at segment boundaries, but can worsen separation quality or transitions. Speed gains depend on the hardware and track.
+- Shifts must be a non-negative integer; overlap must be at least `0` and less than `1`. More shifts or overlap generally mean more processing.
+
+Set these in `.env` (or the service/container environment) and restart the bot. Existing service environment variables take precedence over `.env`. Both engines still process the whole track before playback starts. Demucs's `--two-stems` combines its four estimated sources; MDX uses a model trained for two stems. The engines can produce different vocal bleed and musical artifacts, so compare representative songs before choosing one.
 
 - LRCLIB is searched for matching lyrics. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
@@ -86,9 +97,48 @@ A CPU-only PyTorch build cannot use a GPU, even when Vulkan or another applicati
 - Separation can take several minutes, especially on CPU. The first run downloads model weights and needs internet access, free disk space, and sufficient RAM. Vocal bleed/artifacts are possible. One preparation runs at a time across the bot, with at most one pending request per server.
 - Prepared audio is temporary and removed when the track finishes, is skipped, karaoke is disabled, or the bot disconnects. Model weights remain cached for reuse.
 
-#### Karaoke dependencies
+#### Setup 1: MDX (recommended default)
 
-Use a **64-bit Python 3.11** environment for karaoke: the pinned PyTorch/torchaudio versions do not support Python 3.14. Install FFmpeg on PATH, then on Windows:
+Use a separate **64-bit Python 3.11** environment. Keep any working Demucs environment available if you want to compare results or switch engines:
+
+```bash
+python3.11 -m venv .venv-mdx
+source .venv-mdx/bin/activate
+python -m pip install --upgrade pip
+```
+
+On Windows use `py -3.11 -m venv .venv-mdx`, then `.\.venv-mdx\Scripts\Activate.ps1`.
+
+1. Install FFmpeg and put `ffmpeg` and `ffprobe` on PATH. If pip needs to build `diffq` (an audio-separator dependency), install a C/C++ compiler and development headers matching your Python interpreter first. Minimal Linux systems may also need their OpenMP runtime (`libgomp1` on Debian/Ubuntu).
+2. For **GPU inference**, first install a vendor-matched **PyTorch 2.12.0 / torchvision 0.27.0 / torchaudio** stack using the [PyTorch](https://pytorch.org/get-started/previous-versions/) or [ROCm](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html) instructions for your GPU and OS. The requirements accept torchaudio 2.11.x or 2.12.x because vendor bundles can use different version numbering; use the version supplied with that PyTorch build. Select your actual GPU target if the vendor uses target-specific extras. Do not install the Demucs CPU/GPU requirements in this environment.
+3. Install the bot and MDX dependencies:
+
+   ```bash
+   python -m pip install -r requirements.txt -r requirements-karaoke-mdx.txt
+   python -m pip check
+   ```
+
+   For **CPU inference**, omit step 2; pip installs the default PyTorch packages. The `audio-separator[cpu]` extra supplies ONNX loading/conversion dependencies, **not** the inference device: this worker deliberately converts the model to native PyTorch and verifies its device. An ONNX Runtime warning about a missing CUDA provider does not describe this native inference path. Fixed-statistics BatchNorm layers use torchvision's equivalent inference-only implementation, avoiding runtime BatchNorm kernel compilation.
+
+   MDX requests mixed-precision autocast on GPU and uses full precision on CPU; the effective precision is logged. This is separate from Demucs's shifts/overlap tuning.
+
+4. Set the following in `.env`:
+
+   ```dotenv
+   KARAOKE_BACKEND=mdx
+   KARAOKE_DEVICE=cuda
+   ```
+
+   Use `cpu` instead of `cuda` for CPU-only use, or `auto` for automatic selection. The model downloads on first use and is cached under `~/.cache/discord-vc-bot/models`; set `KARAOKE_MODEL_DIR` to put that cache elsewhere.
+5. Start with this environment's interpreter: `python vc_status_bot.py`. Test a short `/karaoke` request before a full track. GPU kernel compilation and model downloads can make the first request slower.
+
+To switch to Demucs, stop the bot, set `KARAOKE_BACKEND=demucs`, and start it with the Demucs environment's interpreter. For services/containers, change the interpreter, environment, FFmpeg paths, and GPU permissions in the server configuration too; do not edit repository source. Keep tokens, local settings, model weights, and environments out of Git. A fresh clone needs the selected dependency setup, your `.env`, and these server-side runtime settings—not machine-specific code changes.
+
+
+
+#### Setup 2: Demucs (supported quality alternative)
+
+Use a **64-bit Python 3.11** environment for karaoke: the pinned dependencies do not support Python 3.14. Set `KARAOKE_BACKEND=demucs` in `.env`. Install FFmpeg on PATH, then on Windows:
 
 ```powershell
 py -3.11 -m venv .venv-karaoke
@@ -99,7 +149,7 @@ python vc_status_bot.py
 
 On other platforms, create the environment with `python3.11 -m venv .venv-karaoke` and activate it with `source .venv-karaoke/bin/activate`. Install both requirements files in the same environment used to run the bot. The optional dependency file is not needed for normal music, VC statuses, or Instagram embeds.
 
-#### GPU acceleration (CUDA or ROCm)
+##### Demucs GPU acceleration (CUDA or ROCm)
 
 Create a separate **64-bit Python 3.11** environment for GPU karaoke rather than upgrading a working environment in place:
 
@@ -136,7 +186,6 @@ For a background service or container, use this environment's Python interpreter
 
 GPU availability does not guarantee every model operation is supported. Test a short `/karaoke` request to verify separation, WAV export, and voice playback before processing longer tracks. No Vulkan inference backend is provided.
 
-
 ### Setup
 
 The Discord voice dependencies are pinned as a tested pair (`discord.py 2.7.1` and `davey 0.1.0`). With `davey 0.2.0`, live testing found that DAVE negotiation never became ready and playback was silent despite valid PCM and outgoing UDP packets. Keep the pair pinned when reinstalling.
@@ -166,4 +215,5 @@ cogs/music.py           music player
 cogs/music_controls.py  persistent playback buttons and song input forms
 cogs/messages.py        reusable public webhook delivery
 cogs/karaoke.py         instrumental preparation and live/paginated lyrics
+cogs/karaoke_worker.py  isolated Demucs/MDX separation worker
 ```

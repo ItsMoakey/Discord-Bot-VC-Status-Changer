@@ -316,6 +316,7 @@ class Music(commands.Cog):
     async def play_next(
         self, guild: discord.Guild, first: discord.WebhookMessage | None = None,
         header: str = "", completed: Track | None = None,
+        ready_stream: tuple[Track, str] | None = None,
     ):
         async with self.play_locks.setdefault(guild.id, asyncio.Lock()):
             state = self.states.get(guild.id)
@@ -333,6 +334,10 @@ class Music(commands.Cog):
                     state.queue.popleft() if state.queue else None
                 )
                 state.current = track
+                prepared_stream = (
+                    ready_stream[1] if ready_stream is not None and ready_stream[0] is track else None
+                )
+                ready_stream = None
                 if previous is not track and previous and previous.karaoke:
                     await previous.karaoke.finish()
                     if self.states.get(guild.id) is not state or state.current is not track:
@@ -354,6 +359,7 @@ class Music(commands.Cog):
                 try:
                     stream_url = (
                         track.karaoke.audio_path if track.karaoke else
+                        prepared_stream if prepared_stream is not None else
                         await asyncio.to_thread(resolve_stream, track.webpage_url)
                     )
                     # A leave or feature toggle may have happened during extraction.
@@ -586,13 +592,18 @@ class Music(commands.Cog):
         await self.defer(interaction)
         if not await self.control_guard(interaction, feature="music", allow_disconnected=True):
             return
-        await self.join_voice(interaction.guild, interaction.user.voice.channel)
         if is_playlist_url(query):
+            await self.join_voice(interaction.guild, interaction.user.voice.channel)
             return await self.enqueue_playlist(interaction, query)
-        try:
-            info = await asyncio.to_thread(extract_info, query)
-        except Exception as e:
-            log.warning("Lookup failed for %r: %s", query, e)
+        voice_result, info = await asyncio.gather(
+            self.join_voice(interaction.guild, interaction.user.voice.channel),
+            asyncio.to_thread(extract_info, query),
+            return_exceptions=True,
+        )
+        if isinstance(voice_result, BaseException):
+            raise voice_result
+        if isinstance(info, BaseException):
+            log.warning("Lookup failed for %r: %s", query, info)
             return await self.fail(interaction, "Couldn't find anything for that.")
         if not await self.control_guard(interaction, feature="music"):
             return
@@ -603,7 +614,9 @@ class Music(commands.Cog):
             duration=info.get("duration"),
             requester=interaction.user.display_name,
         )
-        await self.enqueue_tracks(interaction, [track], f"Queued: **{track.title}**")
+        await self.enqueue_tracks(
+            interaction, [track], f"Queued: **{track.title}**", ready_stream=(track, info["url"])
+        )
 
     @app_commands.command(name="play", description="Play a song from a URL or search term")
     @app_commands.describe(query="Song link, playlist link, or search words")
@@ -611,7 +624,10 @@ class Music(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str):
         await self.enqueue(interaction, query)
 
-    async def enqueue_tracks(self, interaction: discord.Interaction, tracks: list[Track], header: str):
+    async def enqueue_tracks(
+        self, interaction: discord.Interaction, tracks: list[Track], header: str,
+        ready_stream: tuple[Track, str] | None = None,
+    ):
         if not await self.control_guard(interaction, feature="music"):
             return
         vc = interaction.guild.voice_client
@@ -634,7 +650,7 @@ class Music(commands.Cog):
                     await self.fail(interaction, str(error))
             await self.refresh_panel(interaction.guild, state)
         else:
-            await self.play_next(interaction.guild, first)
+            await self.play_next(interaction.guild, first, ready_stream=ready_stream)
 
 
     async def enqueue_playlist(self, interaction: discord.Interaction, url: str):

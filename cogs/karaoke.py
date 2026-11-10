@@ -1,4 +1,4 @@
-"""Optional Demucs karaoke, with cancellable preparation and LRCLIB lyrics."""
+"""Optional karaoke separation, with cancellable preparation and LRCLIB lyrics."""
 
 from __future__ import annotations
 
@@ -335,12 +335,12 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
             output.seek(max(0, output.tell() - 5000))
             details = output.read().decode("utf-8", errors="replace")
         log.error("Karaoke %s failed (exit %s): %s", stage, code, details)
-        if stage == "demucs":
+        if stage == "separation":
             raise PreparationError(
-                "Instrumental separation failed. Use the documented CPU or GPU karaoke environment "
-                "with matching PyTorch, torchaudio, and audio dependencies, and ensure FFmpeg is on PATH. "
-                "The first htdemucs run downloads model weights and needs internet access "
-                "and free disk/RAM. Check KARAOKE_DEVICE and the console for the actual Demucs/backend error; "
+                "Instrumental separation failed. Use the documented environment for KARAOKE_BACKEND "
+                "with matching PyTorch and audio dependencies, and ensure FFmpeg is on PATH. "
+                "The first run downloads model weights and needs internet access "
+                "and free disk/RAM. Check KARAOKE_DEVICE and the console for the actual backend error; "
                 "cuda requires compatible CUDA/ROCm PyTorch and drivers (Vulkan is unsupported). The original vocals were not played."
             )
         if stage == "ffmpeg":
@@ -349,21 +349,6 @@ async def run_process(args: list[str], root: Path, stage: str) -> None:
             "YouTube audio could not be downloaded. The video may be private, restricted, live, or unavailable; "
             "check the console and update yt-dlp if YouTube extraction is failing."
         )
-DEMUCS_WORKER = r'''
-import os, sys
-import torch
-from demucs.separate import main
-requested = os.getenv("KARAOKE_DEVICE", "auto").strip().lower()
-if requested not in {"auto", "cpu", "cuda"}:
-    raise SystemExit("KARAOKE_DEVICE must be auto, cpu, or cuda. Vulkan is not a PyTorch Demucs backend; use a compatible CUDA/ROCm PyTorch installation.")
-available = torch.cuda.is_available()
-if requested == "cuda" and not available:
-    raise SystemExit("KARAOKE_DEVICE=cuda requires a compatible CUDA/ROCm PyTorch installation and GPU driver; no CPU fallback was attempted.")
-device = "cuda" if requested == "cuda" or (requested == "auto" and available) else "cpu"
-print(f"Demucs backend: {device}; requested={requested}; torch={torch.__version__}; HIP={torch.version.hip}", flush=True)
-main(["--two-stems", "vocals", "-n", "htdemucs", "--device", device, "--out", sys.argv[1], sys.argv[2]])
-'''
-
 
 
 async def prepare_audio(url: str, root: Path) -> tuple[dict, str]:
@@ -378,11 +363,11 @@ async def prepare_audio(url: str, root: Path) -> tuple[dict, str]:
         "-i", str(source), "-vn", "-ar", "44100", "-ac", "2", str(wav),
     ], root, "ffmpeg")
     await run_process([
-        sys.executable, "-c", DEMUCS_WORKER, str(root / "stems"), str(wav),
-    ], root, "demucs")
-    instrumental = root / "stems" / "htdemucs" / "input" / "no_vocals.wav"
+        sys.executable, str(Path(__file__).with_name("karaoke_worker.py")), str(root / "stems"), str(wav),
+    ], root, "separation")
+    instrumental = root / "stems" / "no_vocals.wav"
     if not instrumental.is_file() or instrumental.stat().st_size <= 44:
-        raise PreparationError("Demucs finished without a usable no_vocals.wav. Check its console output; no original audio was queued.")
+        raise PreparationError("Separation finished without a usable no_vocals.wav. Check its console output; no original audio was queued.")
     return info, str(instrumental)
 
 
@@ -661,13 +646,13 @@ class Karaoke(commands.Cog):
         try:
             await progress.update(
                 "Waiting for the karaoke preparation worker. Vocal removal can take several minutes; "
-                "the first run also downloads the htdemucs model. The original vocal audio will never be used as a fallback."
+                "the first run also downloads model weights. The original vocal audio will never be used as a fallback."
             )
             async with self.heavy_jobs:
                 if not self.bot.features.enabled(guild.id, "karaoke"):
                     raise PreparationError("Karaoke was disabled before preparation could start.")
                 temporary = tempfile.TemporaryDirectory(prefix="discord-karaoke-")
-                await progress.update("Downloading YouTube audio and preparing the instrumental with Demucs; backend selection is recorded in the worker log…")
+                await progress.update("Downloading YouTube audio and preparing the instrumental; the selected separation engine and device are recorded in the worker log…")
                 info, audio_path = await prepare_audio(url, Path(temporary.name))
             if not self.bot.features.enabled(guild.id, "karaoke"):
                 raise PreparationError("Karaoke was disabled while this track was being prepared.")
@@ -700,7 +685,7 @@ class Karaoke(commands.Cog):
                 pass
         except Exception:
             log.exception("Karaoke preparation failed")
-            await music.fail(interaction, "Karaoke preparation failed. Check the console, FFmpeg, optional Demucs installation, available memory/disk, and network access. No original audio was queued.")
+            await music.fail(interaction, "Karaoke preparation failed. Check the console, FFmpeg, the selected separation engine's installation, available memory/disk, and network access. No original audio was queued.")
         finally:
             if self.preparations.get(guild.id) is task:
                 self.preparations.pop(guild.id, None)

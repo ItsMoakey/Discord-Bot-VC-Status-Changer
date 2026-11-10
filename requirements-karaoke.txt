@@ -1,4 +1,4 @@
-# Portable CPU/default setup; install alongside requirements.txt with Python 3.11.
+# Demucs CPU alternative; install alongside requirements.txt with Python 3.11.
 # For CUDA/ROCm GPU support, follow the README and use requirements-karaoke-gpu.txt
 # instead of this file. Do not mix the two PyTorch/torchaudio version sets.
 torch==2.5.1
