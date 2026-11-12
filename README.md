@@ -30,7 +30,7 @@ Instagram links no longer embed in Discord, so when someone posts an Instagram p
 
 ### Public messages and buttons
 
-Public playback updates, karaoke preparation/lyrics, and Instagram previews use a reusable bot-owned webhook per channel. Messages display the bot's actual server name and avatar; the underlying integration is named **VC Bot** for discovery. Give the bot **Manage Webhooks** in each channel where these features are used (on the parent channel for threads). Webhook credentials are not written to settings files. Missing access produces an actionable private error instead of silently reverting to normal bot messages.
+Public playback updates, lyrics for normal music and karaoke, karaoke preparation, and Instagram previews use a reusable bot-owned webhook per channel. Messages display the bot's actual server name and avatar; the underlying integration is named **VC Bot** for discovery. Give the bot **Manage Webhooks** in each channel where these features are used (on the parent channel for threads). Webhook credentials are not written to settings files. Missing access produces an actionable private error instead of silently reverting to normal bot messages.
 
 Reusable webhooks do not have interaction tokens' 15-minute expiry. Private errors, queue queries, and administrative confirmations remain private interaction responses.
 
@@ -43,7 +43,7 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 |---|---|
 | `/play <url or search>` | Play or queue a song. A playlist link (YouTube `/playlist?list=...`, SoundCloud sets) queues the first 50 songs; a video link with `&list=` on it plays just that video |
 | `/karaoke <url or search>` | Search for one song or use a supported single-media link, then prepare a vocal-removed instrumental and queue it with synced or paginated lyrics |
-| `/controls` | Post a playback panel with Play, Karaoke, Queue, Pause/Resume, Skip, Loop, Shuffle, Leave, and Bring controls here |
+| `/controls` | Post a playback panel with Play, Karaoke, Queue, Pause/Resume, Skip, Loop, Shuffle, Lyrics, Leave, and Bring controls here |
 | `/move <position> [to]` | Move a song already in the queue to position 1 (next up), or to `to` |
 | `/pause` / `/resume` | Pause or resume |
 | `/skip` | Skip the current song |
@@ -55,11 +55,12 @@ Plays audio from YouTube, SoundCloud and other sites supported by yt-dlp, with a
 | `/joinsound [enabled]` | Toggle the arrival clip for this server, or explicitly set on/off (Manage Channels required) |
 
 - Give the bot **Connect** and **Speak**.
-- Playback status is one rich webhook panel reused when songs start or change; temporary loading messages are removed once the panel updates. The nine buttons use short 3/3/2/1 rows, with Bring controls here on its own row. Buttons survive a bot restart and resolve current server state rather than a stale track. Playback-changing controls require being in the bot's voice channel; Queue is readable server-wide. Play/Karaoke open an input form and recheck feature/voice permissions when submitted.
+- Playback status is one rich webhook panel reused when songs start or change; temporary loading messages are removed once the panel updates. The ten buttons use short 3/3/3/1 rows, with Bring controls here on its own row. Buttons survive a bot restart and resolve current server state rather than a stale track. Playback-changing controls require being in the bot's voice channel; Queue is readable server-wide. Play/Karaoke open an input form and recheck feature/voice permissions when submitted.
 - The canonical panel's channel/message IDs are saved in `playback_panels.json` (override with `PLAYBACK_PANEL_FILE`) so starting playback after a restart reuses it rather than creating duplicates. This contains no webhook credentials; queues themselves still reset on restart.
 - **Bring controls here** (on playback and active lyrics messages) posts fresh controls at the bottom of chat, then deletes the previous controls. It also removes an old panel used after a restart; lyric messages themselves are not deleted. If posting fails, the old controls remain available. `/controls` does the same without needing to scroll to a button.
 - Install [FFmpeg](https://ffmpeg.org/) and keep yt-dlp updated (`pip install -U yt-dlp`), since YouTube changes often.
 - Normal `/play` streams audio directly; it does not run vocal separation or wait for the full track to download. Media lookup runs alongside voice connection/arrival playback, and immediate playback reuses that lookup's stream URL. Queued and looped songs resolve a fresh URL when they actually start. Network extraction, Discord voice negotiation, and the optional arrival clip can still add startup time.
+- **Lyrics** on the playback webhook toggles lyrics for the current song independently of vocal removal. Each normal `/play` song starts with lyrics **off**; each karaoke song starts with lyrics **on**. Turning lyrics on for normal music looks them up without downloading or separating audio, and live lyrics use the song's current playback position. Turning them off stops display updates without stopping audio; turning them back on reuses the lyrics webhook message. The **Full lyrics / Live lyrics** toggle and page buttons remain on that message.
 - The bot leaves on its own when everyone else leaves the voice channel, and a few seconds after the music ends (`IDLE_LEAVE_SECONDS` in `cogs/music.py`). Pending song/playlist lookups and karaoke preparation do not count as idle time. Once the last pending request fails or is cancelled, a fresh idle countdown starts if nothing is playing or queued. Queues are in memory and reset on restart.
 
 #### Join sound
@@ -92,7 +93,7 @@ Set these in `.env` (or the service/container environment) and restart the bot. 
 
 - LRCLIB lookup starts after download metadata is available and runs alongside FFmpeg decoding and vocal separation to reduce startup waiting. Unlike `/play` streaming, karaoke still downloads and processes the whole track before playback; it never streams partially separated audio. Compatible timestamped lyrics advance in a webhook message using the actual PCM playback clock, so pausing also freezes lyric progress. Updates are paced roughly two seconds apart; different recordings or video intros can still cause timing differences.
 - If usable synchronization is unavailable, normal lyrics are shown with **Previous** and **Next** page buttons. A different-duration recording may supply plain lyrics, but not its timestamps. Synced songs also have a **Full lyrics** browsing button. These are shared controls: changing the page changes it for everyone.
-- If no matching lyrics are found or the lyrics service is unavailable, the instrumental still plays with an explanatory message. Vocal-separation failure never falls back to the original vocal audio.
+- If no matching lyrics are found or the lyrics service is unavailable, audio still plays with an explanatory message. Vocal-separation failure never falls back to the original vocal audio.
 - Discord cannot force clients to scroll. Lyrics advance inside one durable webhook message instead, without a 15-minute handoff. Finished sessions disable their lyric controls.
 - Separation can take several minutes, especially on CPU. The first run downloads model weights and needs internet access, free disk space, and sufficient RAM. Vocal bleed/artifacts are possible. One preparation runs at a time across the bot, with at most one pending request per server.
 - Prepared audio is temporary and removed when the track finishes, is skipped, karaoke is disabled, or the bot disconnects. Model weights remain cached for reuse.
@@ -214,6 +215,7 @@ cogs/instagram_embed.py Instagram link embeds
 cogs/music.py           music player
 cogs/music_controls.py  persistent playback buttons and song input forms
 cogs/messages.py        reusable public webhook delivery
-cogs/karaoke.py         instrumental preparation and live/paginated lyrics
+cogs/lyrics.py          shared lyrics lookup, PCM clock, and webhook display
+cogs/karaoke.py         instrumental preparation with lyrics enabled by default
 cogs/karaoke_worker.py  isolated Demucs/MDX separation worker
 ```

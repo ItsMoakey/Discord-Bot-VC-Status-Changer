@@ -18,6 +18,7 @@ from discord.ext import commands
 
 from cogs.messages import PublicMessageError
 from cogs.music_controls import PlaybackInput, PlaybackView
+from cogs.lyrics import LyricsSession
 
 if TYPE_CHECKING:
     from cogs.karaoke import KaraokeSession
@@ -45,6 +46,7 @@ class Track:
     duration: int | None
     requester: str
     karaoke: "KaraokeSession | None" = None
+    lyrics: LyricsSession | None = None
 
 
 def fmt_duration(seconds: int | None) -> str:
@@ -217,11 +219,27 @@ class Music(commands.Cog):
         if not await self.control_guard(interaction, mutation=action not in {"queue", "controls"}):
             return
         await self.defer(interaction)
+        if action == "lyrics":
+            return await self.toggle_lyrics(interaction)
         if action == "pause_resume":
             vc = interaction.guild.voice_client
             action = "resume" if vc and vc.is_paused() else "pause"
         command = getattr(self, action)
         await command.callback(self, interaction)
+
+    async def toggle_lyrics(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        async with self.play_locks.setdefault(guild.id, asyncio.Lock()):
+            state = self.state(guild)
+            track = state.current
+            if track is None or track.lyrics is None:
+                return await self.fail(interaction, "Nothing is playing.")
+            await track.lyrics.set_enabled(not track.lyrics.enabled)
+            await self.refresh_panel(guild, state)
+            await self.bot.messages.reply(
+                interaction, f"Lyrics are now **{'on' if track.lyrics.enabled else 'off'}**.",
+                ephemeral=True,
+            )
 
     def dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
         return self.panel_embed(guild, self.state(guild))
@@ -243,6 +261,7 @@ class Music(commands.Cog):
         embed = discord.Embed(title=f"Playback · {status}", description="\n\n".join(lines)[:4096])
         embed.add_field(name="Loop", value="On" if state.loop else "Off")
         embed.add_field(name="Queued", value=str(len(state.queue)))
+        embed.add_field(name="Lyrics", value="On" if state.current and state.current.lyrics and state.current.lyrics.enabled else "Off")
         if vc and vc.channel:
             embed.set_footer(text=f"Voice: {vc.channel.name}")
         return embed
@@ -365,8 +384,8 @@ class Music(commands.Cog):
                     ready_stream[1] if ready_stream is not None and ready_stream[0] is track else None
                 )
                 ready_stream = None
-                if previous is not track and previous and previous.karaoke:
-                    await previous.karaoke.finish()
+                if previous is not track and previous and previous.lyrics:
+                    await previous.lyrics.finish()
                     if self.states.get(guild.id) is not state or state.current is not track:
                         return
                 vc = guild.voice_client
@@ -394,8 +413,12 @@ class Music(commands.Cog):
                         return
                     options = {"options": "-vn"} if track.karaoke else FFMPEG_OPTS
                     source = discord.FFmpegPCMAudio(stream_url, **options)
-                    if track.karaoke:
-                        source = track.karaoke.wrap_source(source)
+                    if track.lyrics is None:
+                        track.lyrics = LyricsSession(
+                            self.bot, state.text_channel, track.title,
+                            info={"title": track.title, "duration": track.duration},
+                        )
+                    source = track.lyrics.wrap_source(source)
 
                     def after(err, played=track):
                         if err:
@@ -412,8 +435,7 @@ class Music(commands.Cog):
                     state.loop = False
                     header += f"Couldn't play **{track.title}**, skipping.\n"
                     continue
-                if track.karaoke:
-                    await track.karaoke.start()
+                await track.lyrics.start()
                 await self.announce(state, header.rstrip(), first)
                 return
 
@@ -428,8 +450,8 @@ class Music(commands.Cog):
             state.idle_task.cancel()
             state.idle_task = None
         for track in tracks:
-            if track.karaoke:
-                await track.karaoke.finish(reason)
+            if track.lyrics:
+                await track.lyrics.finish(reason)
 
     async def disconnect(self, guild: discord.Guild, reason: str = "Disconnected"):
         state = self.states.pop(guild.id, None)
@@ -457,8 +479,8 @@ class Music(commands.Cog):
         removed = [track for track in state.queue if matches(track)]
         state.queue = deque(track for track in state.queue if not matches(track))
         for track in removed:
-            if track.karaoke:
-                await track.karaoke.finish("Karaoke disabled")
+            if track.lyrics:
+                await track.lyrics.finish("Karaoke disabled" if feature == "karaoke" else "Music disabled")
         current = state.current
         if current and matches(current):
             state.loop = False

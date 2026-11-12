@@ -67,6 +67,7 @@ class PlaybackView(discord.ui.View):
             ("skip", "Skip", 1, discord.ButtonStyle.secondary),
             ("loop", "Loop", 1, discord.ButtonStyle.secondary),
             ("shuffle", "Shuffle", 2, discord.ButtonStyle.secondary),
+            ("lyrics", "Lyrics", 2, discord.ButtonStyle.secondary),
             ("leave", "Leave", 2, discord.ButtonStyle.danger),
             ("controls", "Bring controls here", 3, discord.ButtonStyle.primary),
         ):
