@@ -227,8 +227,8 @@ class PreparationProgress:
         if self.message is None:
             return
         text = (
-            "Instrumental preparation complete; see the playback/queue and lyrics messages."
-            if accepted else "Karaoke preparation ended without queueing audio; see the command error."
+            "Karaoke ready."
+            if accepted else "Karaoke not queued."
         )
         try:
             await self.interaction.client.messages.edit(self.message, text)
@@ -242,14 +242,14 @@ class Karaoke(commands.Cog):
         self.preparations: dict[int, asyncio.Task] = {}
         self.heavy_jobs = asyncio.Semaphore(1)
 
-    @app_commands.command(name="karaoke", description="Prepare a song instrumental with real vocal removal and lyrics")
+    @app_commands.command(name="karaoke", description="Play a song without vocals, with lyrics")
     @app_commands.describe(query="Song link or search words (one song, not a playlist)")
     @app_commands.guild_only()
     async def karaoke(self, interaction: discord.Interaction, query: str) -> None:
         guild = interaction.guild
         music = self.bot.get_cog("Music")
         if music is None:
-            return await interaction.response.send_message("The music service is unavailable. Ask the bot owner to load it.", ephemeral=True)
+            return await interaction.response.send_message("Music is unavailable.", ephemeral=True)
         async with music.preparing_track(guild):
             await self._karaoke(interaction, query, music)
 
@@ -268,16 +268,16 @@ class Karaoke(commands.Cog):
         query = query.strip()
         if is_playlist_url(query):
             return await interaction.response.send_message(
-                "Karaoke prepares one song at a time. Use a song link or search words, not a playlist link.", ephemeral=True,
+                "Use a single song, not a playlist.", ephemeral=True,
             )
         if guild.id in self.preparations:
-            return await interaction.response.send_message("A karaoke track is already being prepared for this server. Please wait.", ephemeral=True)
+            return await interaction.response.send_message("Already preparing karaoke. Please wait.", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         task = asyncio.current_task()
         # No await between the duplicate check and registration after defer: another request
         # may have entered during defer, so check once more before taking ownership.
         if guild.id in self.preparations:
-            return await music.fail(interaction, "A karaoke track is already being prepared for this server. Please wait.")
+            return await music.fail(interaction, "Already preparing karaoke. Please wait.")
         self.preparations[guild.id] = task
         temporary = None
         session = None
@@ -285,14 +285,13 @@ class Karaoke(commands.Cog):
         progress = PreparationProgress(interaction)
         try:
             await progress.update(
-                "Waiting for the karaoke preparation worker. Vocal removal can take several minutes; "
-                "the first run also downloads model weights. The original vocal audio will never be used as a fallback."
+                "Waiting to prepare karaoke. This may take a few minutes."
             )
             async with self.heavy_jobs:
                 if not self.bot.features.enabled(guild.id, "karaoke"):
                     raise PreparationError("Karaoke was disabled before preparation could start.")
                 temporary = tempfile.TemporaryDirectory(prefix="discord-karaoke-")
-                await progress.update("Finding and downloading the song, then preparing the instrumental and looking up lyrics in parallel; the selected separation engine and device are recorded in the worker log…")
+                await progress.update("Preparing the instrumental and lyrics...")
                 info, audio_path, lyrics = await prepare_audio(query, Path(temporary.name))
             if not self.bot.features.enabled(guild.id, "karaoke"):
                 raise PreparationError("Karaoke was disabled while this track was being prepared.")
@@ -308,7 +307,7 @@ class Karaoke(commands.Cog):
         except asyncio.CancelledError:
             # Each subprocess has been killed/reaped by run_process before reaching this cleanup.
             try:
-                await music.fail(interaction, "Karaoke preparation was cancelled (the feature was disabled or the cog was unloaded).")
+                await music.fail(interaction, "Karaoke preparation cancelled.")
             except discord.HTTPException:
                 pass
             raise
@@ -322,7 +321,7 @@ class Karaoke(commands.Cog):
                 pass
         except Exception:
             log.exception("Karaoke preparation failed")
-            await music.fail(interaction, "Karaoke preparation failed. Check the console, FFmpeg, the selected separation engine's installation, available memory/disk, and network access. No original audio was queued.")
+            await music.fail(interaction, "Couldn't prepare karaoke. Check the bot logs.")
         finally:
             if self.preparations.get(guild.id) is task:
                 self.preparations.pop(guild.id, None)

@@ -151,18 +151,13 @@ class VCStatus(commands.Cog):
         if not looks_like_emoji(emoji):
             return await interaction.response.send_message("Thats not an emoji 💀", ephemeral=True)
 
-        updated = user.id in self.user_emojis
         self.user_emojis[user.id] = emoji
         save_assignments(self.user_emojis)
 
-        live_note = ""
         if user.voice and user.voice.channel:
             await self.refresh_channel(user.voice.channel)
-            live_note = " They're in a VC right now, take a look!"
-
-        verb = "Updated" if updated else "Done"
         await interaction.response.send_message(
-            f"{verb}! {user.mention} → {emoji}{live_note}", ephemeral=True
+            f"{user.mention} → {emoji}", ephemeral=True
         )
 
     @app_commands.command(name="vcdelete", description="Remove your (or someone else's) VC emoji.")
@@ -187,7 +182,7 @@ class VCStatus(commands.Cog):
             await self.refresh_channel(user.voice.channel)
 
         await interaction.response.send_message(
-            f"Removed {removed} from {user.mention}, they'll show as blank next time they're in a VC.",
+            f"Removed {removed} from {user.mention}.",
             ephemeral=True,
         )
 
@@ -199,7 +194,7 @@ class VCStatus(commands.Cog):
     async def vclist(self, interaction: discord.Interaction):
         if not self.user_emojis:
             return await interaction.response.send_message(
-                "Nobody has an emoji yet - use `/vcadd` to set one!", ephemeral=True
+                "No emojis set. Use `/vcadd` to add one.", ephemeral=True
             )
 
         member = interaction.guild.get_member(interaction.user.id)
@@ -240,11 +235,11 @@ class VCStatus(commands.Cog):
         if await self.update_channel_status(channel, status):
             label = readable_emoji(status) if status else "(cleared)"
             await interaction.response.send_message(
-                f"Done! **{channel.name}** is now showing {label}.", ephemeral=True
+                f"**{channel.name}**: {label}", ephemeral=True
             )
         else:
             await interaction.response.send_message(
-                f"Something went wrong with **{channel.name}**, check the console.", ephemeral=True
+                f"Couldn't update **{channel.name}**.", ephemeral=True
             )
 
     @app_commands.command(name="vctoggle", description="Pause or resume the bot for the VC you're currently in.")
@@ -264,10 +259,10 @@ class VCStatus(commands.Cog):
         channel = member.voice.channel
         if channel.id in self.disabled_channels:
             self.disabled_channels.discard(channel.id)
-            msg = f"Resumed **#{channel.name}** - statuses will update automatically again."
+            msg = f"Resumed **#{channel.name}**."
         else:
             self.disabled_channels.add(channel.id)
-            msg = f"Paused **#{channel.name}** - statuses won't update until you toggle it back on."
+            msg = f"Paused **#{channel.name}**."
         await interaction.response.send_message(msg, ephemeral=True)
 
 
